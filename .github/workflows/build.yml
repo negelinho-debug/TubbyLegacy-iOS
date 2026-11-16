@@ -11,903 +11,42 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 25
     steps:
-      - name: Prepare the game patch and iOS host
-        shell: bash
+      - uses: actions/checkout@v4
+        with:
+          ref: 309ed8be7cc89b30c8ac45548d89ea07287c63b5
+
+      - name: Restore and prepare the port
         run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP"
-          mkdir -p tubbylegacy-port
-          cd tubbylegacy-port
-          cat > download_game.py <<'TUBBYLEGACY_DOWNLOAD_GAME_PY'
-          """Fetch the exact TubbyLegacy prologue used for this port."""
+          python3 - <<'PY'
           import hashlib
-          import json
-          import shutil
-          import sys
-          import tempfile
-          import urllib.request
-          import zipfile
-          from pathlib import Path, PurePosixPath
+          from pathlib import Path
 
-          UPLOAD = "https://rontheshotgunner.itch.io/tubbylegacy-the-last-custard/file/20269494"
-          SHA256 = "782a8a75d1f0f0894d17a111896ebf41b7da3039f1b0f3221ab8c612b92a0ed5"
+          source = Path(".github/workflows/build.yml").read_text(encoding="utf-8")
+          restored = source.encode("latin-1")
+          expected = "d57690b54c36a93b16432e7ac94561a03808836b3a0e51c1ee1a32b92f7f5a74"
+          if hashlib.sha256(restored).hexdigest() != expected:
+              raise SystemExit("Unexpected TubbyLegacy workflow contents")
+          Path("recovered-build.yml").write_bytes(restored)
+          PY
+          ruby -ryaml -e '
+            workflow = YAML.load_file("recovered-build.yml")
+            puts workflow.fetch("jobs").fetch("package").fetch("steps").first.fetch("run")
+          ' > "$RUNNER_TEMP/prepare-tubbylegacy.sh"
+          bash "$RUNNER_TEMP/prepare-tubbylegacy.sh"
 
-
-          def extract_game(source, destination):
-              if hashlib.file_digest(source, "sha256").hexdigest() != SHA256:
-                  raise ValueError("The prologue ZIP has changed. Review the files before applying the patch.")
-              source.seek(0)
-              with zipfile.ZipFile(source) as archive:
-                  roots = [PurePosixPath(name).parent.parent for name in archive.namelist()
-                           if PurePosixPath(name).parts[-2:] == ("Data", "Scripts.rxdata")]
-                  if len(roots) != 1:
-                      raise ValueError("Expected one RPG Maker XP game folder.")
-                  root = roots[0]
-                  for entry in archive.infolist():
-                      path = PurePosixPath(entry.filename)
-                      if entry.is_dir() or not path.is_relative_to(root) or ".." in path.parts:
-                          continue
-                      relative = path.relative_to(root)
-                      if relative.parts[0] == "Graphics" and relative.suffix.lower() == ".ini":
-                          continue
-                      if relative.parts[0] not in {"Data", "Graphics", "Audio", "Game.ini", "CREDITS.txt"}:
-                          continue
-                      target = destination.joinpath(*relative.parts)
-                      target.parent.mkdir(parents=True, exist_ok=True)
-                      with archive.open(entry) as original, target.open("wb") as output:
-                          shutil.copyfileobj(original, output)
-              if not (destination / "Data" / "Scripts.rxdata").is_file():
-                  raise ValueError("The archive is missing its RPG Maker XP scripts.")
-
-
-          if __name__ == "__main__":
-              target = Path(sys.argv[1])
-              if len(sys.argv) == 3:
-                  with open(sys.argv[2], "rb") as local:
-                      extract_game(local, target)
-              else:
-                  with tempfile.TemporaryFile() as archive:
-                      request = urllib.request.Request(UPLOAD, data=b"")
-                      with urllib.request.urlopen(request, timeout=30) as response:
-                          url = json.load(response)["url"]
-                      with urllib.request.urlopen(url, timeout=90) as response:
-                          shutil.copyfileobj(response, archive)
-                      archive.seek(0)
-                      extract_game(archive, target)
-          TUBBYLEGACY_DOWNLOAD_GAME_PY
-          cat > patch_game.rb <<'TUBBYLEGACY_PATCH_GAME_RB'
-          # encoding: UTF-8
-          require "fileutils"
-          require "zlib"
-
-          game, port = ARGV
-          Dir.chdir(game)
-          FileUtils.cp(File.join(port, "Locale.tsv"), "Locale.tsv")
-          FileUtils.cp(File.join(port, "locale.rb"), "Locale.rb")
-          File.write("Game.ini", "[Game]\nLibrary=RGSS104E.dll\nScripts=Data/Scripts.rxdata\nTitle=TubbyLegacy: The Last Custard\nRTP1=\nRTP2=\nRTP3=\n")
-          File.write("mkxp.json", <<~JSON)
-            {"rgssVersion":1,"fixedAspectRatio":true,"vsync":true,"useScriptNames":true,"anyAltToggleFS":false}
-          JSON
-          scripts = Marshal.load(File.binread("Data/Scripts.rxdata"))
-
-          def edit(scripts, name)
-            record = scripts.find { |entry| entry[1] == name } or abort "Missing script: #{name}"
-            code = Zlib::Inflate.inflate(record[2]).force_encoding(Encoding::UTF_8).gsub("\r\n", "\n")
-            replacement = yield code
-            RubyVM::InstructionSequence.compile(replacement, name) if defined?(RubyVM::InstructionSequence)
-            record[2] = Zlib::Deflate.deflate(replacement)
-          end
-
-          def replace!(code, from, to)
-            abort "Patch target missing: #{from.inspect}" unless code.include?(from)
-            code.gsub!(from) { to }
-          end
-
-          def localize_literals(code, strings)
-            strings.each do |text|
-              literal = text.dump
-              replace!(code, literal, "LegacyLocale.text(#{literal})")
-            end
-          end
-
-          edit(scripts, "Interpreter 3") do |code|
-            replace!(code, '@list[@index].parameters[0] + "\n"', 'LegacyLocale.text(@list[@index].parameters[0]) + "\n"')
-            replace!(code, '@list[@index+1].parameters[0] + "\n"', 'LegacyLocale.text(@list[@index+1].parameters[0]) + "\n"')
-            code
-          end
-          edit(scripts, "Interpreter 1") do |code|
-            replace!(code, '$game_temp.message_text += text + "\n"', '$game_temp.message_text += LegacyLocale.text(text) + "\n"')
-            code
-          end
-          edit(scripts, "Scene_Title") do |code|
-            localize_literals(code, ["New Game", "Continue", "Quit Game", "Press", "SPACE to Start"])
-            replace!(code, '[s1, s2, s3]', '[s1, s2, LegacyLocale::MENU[LegacyLocale.index], s3]')
-            replace!(code, '@target_y = 288', '@target_y = 272')
-            replace!(code, "when 2\ncommand_shutdown", "when 2\n$scene = Scene_LegacyLanguage.new\nwhen 3\ncommand_shutdown")
-            replace!(code, 'selected_quote = quote_pool[rand(quote_pool.size)]', 'selected_quote = LegacyLocale.text(quote_pool[rand(quote_pool.size)])')
-            code
-          end
-          edit(scripts, "Scene_Menu") do |code|
-            localize_literals(code, ["Save Game", "End Game"])
-            replace!(code, '$data_system.words.item', 'LegacyLocale.text($data_system.words.item)')
-            code
-          end
-          {
-            "Scene_End" => ["To Title", "Quit Game", "Cancel"],
-            "Scene_Save" => ["Which file would you like to save to?"],
-            "Scene_Load" => ["Which file would you like to load?"],
-            "Window_PlayTime" => ["Play Time"],
-            "Window_Steps" => ["Step Count"]
-          }.each do |name, strings|
-            edit(scripts, name) { |code| localize_literals(code, strings); code }
-          end
-          edit(scripts, "Location_Tracker") do |code|
-            localize_literals(code, ["Location:", "Location", "Prologue", "Unknown Area"])
-            replace!(code, 'return $data_mapinfos[@map_id].name', 'return LegacyLocale.text($data_mapinfos[@map_id].name)')
-            replace!(code, 'saved_map_name = $data_mapinfos[saved_map_id].name', 'saved_map_name = LegacyLocale.text($data_mapinfos[saved_map_id].name)')
-            code
-          end
-          edit(scripts, "Objective_Tracker") do |code|
-            localize_literals(code, ["Objective:"])
-            replace!(code, '$game_variables[3].to_s', 'LegacyLocale.text($game_variables[3].to_s)')
-            code
-          end
-          edit(scripts, "Save_File_9") do |code|
-            replace!(code, '"File #{i + 1}"', 'LegacyLocale.text("File") + " #{i + 1}"')
-            replace!(code, '"File #{@file_index + 1}"', 'LegacyLocale.text("File") + " #{@file_index + 1}"')
-            code
-          end
-          edit(scripts, "Window_Item") do |code|
-            replace!(code, "32, item.name, 0)", "32, LegacyLocale.text(item.name), 0)")
-            code
-          end
-          edit(scripts, "Backpack_Text_Fix") do |code|
-            replace!(code, 'words = text.to_s.split(" ")', 'words = LegacyLocale.text(text.to_s).split(" ")')
-            code
-          end
-          edit(scripts, "Game_Over_Tips") do |code|
-            replace!(code, 'selected_tip = tips[rand(tips.size)]', 'selected_tip = LegacyLocale.text(tips[rand(tips.size)])')
-            code
-          end
-          # The released prologue has an empty Movies folder and no event calls to
-          # play_movie. Its cutscenes are RPG Maker picture and dialogue events.
-          edit(scripts, "Dialogue") do |code|
-            replace!(code, "self.contents = Bitmap.new(width - 32, height - 32)",
-                     "self.contents = Bitmap.new(width - 32, height - 32)\n    self.contents.font.size = 20")
-            code
-          end
-          edit(scripts, "Scene_Movie") { |_code| "# Windows-only movie extension, unused in the prologue.\n" }
-          edit(scripts, "Main") { |code| "load \"Locale.rb\"\n" + code }
-
-          # Marshal 4.8 stores Ruby 3 String encoding metadata only for tagged strings.
-          # Read all records as existing binary strings and keep the compressed sources binary.
-          File.binwrite("Data/Scripts.rxdata", Marshal.dump(scripts))
-          TUBBYLEGACY_PATCH_GAME_RB
-          cat > locale.rb <<'TUBBYLEGACY_LOCALE_RB'
-          # encoding: UTF-8
-          module LegacyLocale
-            LANGUAGES = ["English", "Ð ÑÑÑÐºÐ¸Ð¹", "Ð£ÐºÑÐ°ÑÐ½ÑÑÐºÐ°"]
-            MENU = ["Language", "Ð¯Ð·ÑÐº", "ÐÐ¾Ð²Ð°"]
-            @translations = {}
-            File.open("Locale.tsv", "r:UTF-8") do |file|
-              file.each_line do |line|
-                source, english, russian, ukrainian = line.chomp.split("\t", 4)
-                @translations[source] = [english, russian, ukrainian]
-              end
-            end
-            @index = 0
-            if File.file?("Language.txt")
-              saved = File.read("Language.txt").to_i
-              @index = saved if LANGUAGES[saved] && saved >= 0
-            end
-
-            def self.index
-              @index
-            end
-
-            def self.index=(value)
-              return unless value.between?(0, LANGUAGES.length - 1)
-              File.open("Language.txt", "w") { |file| file.write(value.to_s) }
-              @index = value
-            end
-
-            def self.text(source)
-              variants = @translations[source]
-              variants ? variants[@index] : source
-            end
-          end
-
-          class Scene_LegacyLanguage
-            def main
-              window = Window_Command.new(230, LegacyLocale::LANGUAGES)
-              window.x = (640 - window.width) / 2
-              window.y = (480 - window.height) / 2
-              window.index = LegacyLocale.index
-              credits = Window_Base.new(16, 342, 608, 120)
-              credits.contents = Bitmap.new(576, 88)
-              credits.contents.font.size = 16
-              ["TubbyLegacy: Ron the Shotgunner",
-               "mkxp-z-apple-mobile, Copyright (C) 2026 Mateo M.",
-               "https://github.com/mateo-m/mkxp-z-apple-mobile"].each_with_index do |line, row|
-                credits.contents.draw_text(0, row * 24, 576, 26, line, 1)
-              end
-              Graphics.transition(8)
-              while $scene.equal?(self)
-                Graphics.update
-                Input.update
-                window.update
-                if Input.trigger?(Input::C)
-                  LegacyLocale.index = window.index
-                  $game_system.se_play($data_system.decision_se)
-                  $scene = Scene_Title.new
-                elsif Input.trigger?(Input::B)
-                  $game_system.se_play($data_system.cancel_se)
-                  $scene = Scene_Title.new
-                end
-              end
-              Graphics.freeze
-            ensure
-              window.dispose if window && !window.disposed?
-              credits.dispose if credits && !credits.disposed?
-            end
-          end
-
-          class Window_Base
-            alias legacy_draw_item_name draw_item_name
-            def draw_item_name(item, x, y)
-              return legacy_draw_item_name(item, x, y) if item.nil?
-              label = LegacyLocale.text(item.name)
-              return legacy_draw_item_name(item, x, y) if label == item.name
-              icon = RPG::Cache.icon(item.icon_name)
-              self.contents.blt(x, y + 4, icon, Rect.new(0, 0, 24, 24))
-              self.contents.font.color = normal_color
-              self.contents.draw_text(x + 28, y, 212, 32, label)
-            end
-          end
-
-          module RPG::Cache
-            class << self
-              alias legacy_picture picture
-
-              def picture(filename)
-                index = LegacyLocale.index
-                key = filename.to_s.downcase
-                return legacy_picture(filename) unless index != 0 &&
-                  ["warning screen", "collectible found!"].include?(key)
-                @legacy_localized_pictures ||= {}
-                cache_key = [key, index]
-                bitmap = @legacy_localized_pictures[cache_key]
-                return bitmap if bitmap && !bitmap.disposed?
-
-                original = legacy_picture(filename)
-                bitmap = Bitmap.new(original.width, original.height)
-                bitmap.blt(0, 0, original, Rect.new(0, 0, original.width, original.height))
-                bitmap.fill_rect(44, 12, bitmap.width - 88, bitmap.height - 24, Color.new(0, 0, 0))
-                if key == "warning screen"
-                  title = ["ÐÐ ÐÐÐ£ÐÐ ÐÐÐÐÐÐÐ", "ÐÐÐÐÐ ÐÐÐÐÐÐÐ¯"][index - 1]
-                  lines = [
-                    ["Ð Ð¸Ð³ÑÐµ ÐµÑÑÑ Ð¶ÐµÑÑÐ¾ÐºÐ¸Ðµ ÑÑÐµÐ½Ñ, ÐºÑÐ¾Ð²Ñ Ð¸ Ð²ÑÐ¿ÑÑÐºÐ¸ ÑÐ²ÐµÑÐ°.",
-                     "ÐÑÐ¿ÑÑÐºÐ¸ Ð¼Ð¾Ð³ÑÑ Ð²ÑÐ·Ð²Ð°ÑÑ Ð¿ÑÐ¸ÑÑÑÐ¿ ÑÐ¿Ð¸Ð»ÐµÐ¿ÑÐ¸Ð¸.",
-                     "ÐÐ°ÑÑÐ°Ð³Ð¸Ð²Ð°ÑÑÑÑ ÑÐµÐ¼Ñ ÑÑÐµÐ²Ð¾Ð¶Ð½Ð¾ÑÑÐ¸, Ð´ÐµÐ¿ÑÐµÑÑÐ¸Ð¸,",
-                     "Ð½Ð°ÑÐ¸Ð»Ð¸Ñ, ÑÐ°Ð¼Ð¾Ð¿Ð¾Ð²ÑÐµÐ¶Ð´ÐµÐ½Ð¸Ñ Ð¸ ÑÑÐ¸ÑÐ¸Ð´Ð°.",
-                     "ÐÐ²ÑÐ¾Ñ Ð½Ðµ ÑÐµÐºÐ¾Ð¼ÐµÐ½Ð´ÑÐµÑ Ð¸Ð³ÑÑ Ð»ÑÐ´ÑÐ¼ Ð¼Ð»Ð°Ð´ÑÐµ 18 Ð»ÐµÑ",
-                     "Ð¸ ÑÐµÐ¼, ÐºÐ¾Ð³Ð¾ ÑÐ°ÐºÐ¾Ð¹ ÐºÐ¾Ð½ÑÐµÐ½Ñ Ð¼Ð¾Ð¶ÐµÑ ÑÐ¸Ð»ÑÐ½Ð¾ ÑÐ°ÑÑÑÑÐ¾Ð¸ÑÑ.",
-                     "ÐÑÐµ Ð¿ÐµÑÑÐ¾Ð½Ð°Ð¶Ð¸ Ð¸ Ð¸Ð¼ÐµÐ½Ð° Ð²ÑÐ¼ÑÑÐ»ÐµÐ½Ñ."],
-                    ["Ð£ Ð³ÑÑ Ñ Ð¶Ð¾ÑÑÑÐ¾ÐºÑ ÑÑÐµÐ½Ð¸, ÐºÑÐ¾Ð² Ñ ÑÐ¿Ð°Ð»Ð°ÑÐ¸ ÑÐ²ÑÑÐ»Ð°.",
-                     "Ð¡Ð¿Ð°Ð»Ð°ÑÐ¸ Ð¼Ð¾Ð¶ÑÑÑ Ð²Ð¸ÐºÐ»Ð¸ÐºÐ°ÑÐ¸ Ð½Ð°Ð¿Ð°Ð´ ÐµÐ¿ÑÐ»ÐµÐ¿ÑÑÑ.",
-                     "ÐÑÐ° Ð¿Ð¾ÑÑÑÑÑ ÑÐµÐ¼Ð¸ ÑÑÐ¸Ð²Ð¾Ð¶Ð½Ð¾ÑÑÑ, Ð´ÐµÐ¿ÑÐµÑÑÑ,",
-                     "Ð½Ð°ÑÐ¸Ð»ÑÑÑÐ²Ð°, ÑÐ°Ð¼Ð¾ÑÑÐºÐ¾Ð´Ð¶ÐµÐ½Ð½Ñ ÑÐ° ÑÑÑÑÐ¸Ð´Ñ.",
-                     "ÐÐ²ÑÐ¾Ñ Ð½Ðµ ÑÐµÐºÐ¾Ð¼ÐµÐ½Ð´ÑÑ Ð³ÑÑ Ð»ÑÐ´ÑÐ¼ Ð¼Ð¾Ð»Ð¾Ð´ÑÐµ 18 ÑÐ¾ÐºÑÐ²",
-                     "Ñ ÑÐ¸Ð¼, ÐºÐ¾Ð³Ð¾ ÑÐ°ÐºÐ¸Ð¹ Ð²Ð¼ÑÑÑ Ð¼Ð¾Ð¶Ðµ ÑÐ¸Ð»ÑÐ½Ð¾ Ð·Ð°ÑÐ¼ÑÑÐ¸ÑÐ¸.",
-                     "Ð£ÑÑ Ð¿ÐµÑÑÐ¾Ð½Ð°Ð¶Ñ ÑÐ° ÑÐ¼ÐµÐ½Ð° Ð²Ð¸Ð³Ð°Ð´Ð°Ð½Ñ."]
-                  ][index - 1]
-                else
-                  title = ["ÐÐÐÐÐÐ ÐÐ ÐÐÐÐÐ¢!", "ÐÐÐÐÐÐÐÐ ÐÐ ÐÐÐÐÐ¢!"][index - 1]
-                  lines = [
-                    ["ÐÐ¾Ð»Ð»ÐµÐºÑÐ¸Ð¾Ð½Ð½ÑÐµ Ð¿ÑÐµÐ´Ð¼ÐµÑÑ ÑÐ¿ÑÑÑÐ°Ð½Ñ Ð¿Ð¾ Ð²ÑÐµÐ¹ Ð¸Ð³ÑÐµ.",
-                     "ÐÐ½Ð¸ Ð¼Ð¾Ð³ÑÑ Ð¿ÑÐ¸Ð³Ð¾Ð´Ð¸ÑÑÑÑ Ð² Ð¸Ð³ÑÐµ, Ð° Ð¼Ð¾Ð³ÑÑ Ð±ÑÑÑ Ð¿ÑÐ¾ÑÑÐ¾",
-                     "ÑÐ°ÑÑÑÑ ÐºÐ¾Ð»Ð»ÐµÐºÑÐ¸Ð¸. ÐÑÐ¸ Ð½Ð°ÑÐ¾Ð´ÐºÐµ Ð¿Ð¾ÑÐ²Ð¸ÑÑÑ ÑÐ²ÐµÐ´Ð¾Ð¼Ð»ÐµÐ½Ð¸Ðµ.",
-                     "ÐÑÐµÐ´Ð¼ÐµÑÑ Ð¼Ð¾Ð¶Ð½Ð¾ Ð¿Ð¾ÑÐ¼Ð¾ÑÑÐµÑÑ Ð² ÑÑÐºÐ·Ð°ÐºÐµ.",
-                     "ÐÑ Ð¾Ð¿Ð¸ÑÐ°Ð½Ð¸Ðµ Ð¾ÑÐ¼ÐµÑÐµÐ½Ð¾ ÑÐ»Ð¾Ð²Ð¾Ð¼ Â«ÐÐÐÐÐÐÐ¦ÐÐ¯Â».",
-                     "ÐÐ°Ð³Ð»ÑÐ´ÑÐ²Ð°Ð¹ Ð² ÑÐºÑÐ¾Ð¼Ð½ÑÐµ ÑÐ³Ð¾Ð»ÐºÐ¸!"],
-                    ["ÐÐ¾Ð»ÐµÐºÑÑÐ¹Ð½Ñ Ð¿ÑÐµÐ´Ð¼ÐµÑÐ¸ Ð·Ð°ÑÐ¾Ð²Ð°Ð½Ñ Ð¿Ð¾ Ð²ÑÑÐ¹ Ð³ÑÑ.",
-                     "ÐÐ¾Ð½Ð¸ Ð¼Ð¾Ð¶ÑÑÑ Ð·Ð½Ð°Ð´Ð¾Ð±Ð¸ÑÐ¸ÑÑ Ñ Ð³ÑÑ Ð°Ð±Ð¾ Ð±ÑÑÐ¸ Ð¿ÑÐ¾ÑÑÐ¾",
-                     "ÑÐ°ÑÑÐ¸Ð½Ð¾Ñ ÐºÐ¾Ð»ÐµÐºÑÑÑ. ÐÑÑÐ»Ñ Ð·Ð½Ð°ÑÑÐ´ÐºÐ¸ Ð·'ÑÐ²Ð¸ÑÑÑÑ ÑÐ¿Ð¾Ð²ÑÑÐµÐ½Ð½Ñ.",
-                     "ÐÑÐµÐ´Ð¼ÐµÑÐ¸ Ð¼Ð¾Ð¶Ð½Ð° Ð¿ÐµÑÐµÐ³Ð»ÑÐ½ÑÑÐ¸ Ð² ÑÑÐºÐ·Ð°ÐºÑ.",
-                     "ÐÑÐ½Ñ Ð¾Ð¿Ð¸ÑÐ¸ Ð¿Ð¾Ð·Ð½Ð°ÑÐµÐ½Ñ ÑÐ»Ð¾Ð²Ð¾Ð¼ Â«ÐÐÐÐÐÐ¦ÐÐ¯Â».",
-                     "ÐÐ°Ð·Ð¸ÑÐ½Ð¸ Ð² Ð·Ð°ÑÐ¸ÑÐ½Ñ ÐºÑÑÐ¾ÑÐºÐ¸!"]
-                  ][index - 1]
-                end
-                bitmap.font.size = 34
-                bitmap.font.bold = true
-                bitmap.font.color = Color.new(235, 35, 35)
-                bitmap.draw_text(48, 20, bitmap.width - 96, 56, title, 1)
-                bitmap.font.color = Color.new(255, 255, 255)
-                bitmap.font.size = 21
-                lines.each_with_index do |line, row|
-                  bitmap.draw_text(48, 130 + row * 32, bitmap.width - 96, 32, line, 1)
-                end
-                @legacy_localized_pictures[cache_key] = bitmap
-              end
-            end
-          end
-          TUBBYLEGACY_LOCALE_RB
-          cat > Locale.tsv <<'TUBBYLEGACY_LOCALE_TSV'
-          \name[Shotgun]These must be the files that the 	\name[Shotgun]These must be the files that the 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð­ÑÐ¾ Ð´Ð¾Ð»Ð¶Ð½Ñ Ð±ÑÑÑ ÑÐµ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÑ,	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¦Ðµ Ð¼Ð°ÑÑÑ Ð±ÑÑÐ¸ ÑÑ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¸,
-          boss needed...	boss needed...	ÐºÐ¾ÑÐ¾ÑÑÐµ Ð½ÑÐ¶Ð½Ñ ÐºÐ¾Ð¼Ð°Ð½Ð´Ð¸ÑÑâ¦	ÑÐºÑ Ð¿Ð¾ÑÑÑÐ±Ð½Ñ ÐºÐ¾Ð¼Ð°Ð½Ð´Ð¸ÑÑâ¦
-          \name[Shotgun]Time to get out of here...	\name[Shotgun]Time to get out of here...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾ÑÐ° Ð²ÑÐ±Ð¸ÑÐ°ÑÑÑÑ Ð¾ÑÑÑÐ´Ð°â¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð§Ð°Ñ Ð²Ð¸Ð±Ð¸ÑÐ°ÑÐ¸ÑÑ Ð·Ð²ÑÐ´ÑÐ¸â¦
-          \name[Shotgun]Wait... What is that?!	\name[Shotgun]Wait... What is that?!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð³Ð¾Ð´Ð¸â¦ Ð­ÑÐ¾ ÐµÑÑ ÑÑÐ¾?!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡ÑÑÐ¸Ð²Ð°Ð¹â¦ Ð¦Ðµ ÑÐµ ÑÐ¾?!
-          \name[Shotgun]INFECTED!! I NEED TO RUN NOW!!!	\name[Shotgun]INFECTED!! I NEED TO RUN NOW!!!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐÐ ÐÐÐÐÐÐ«Ð! ÐÐÐÐ ÐÐÐÐÐ¢Ð¬!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐÐ ÐÐÐÐÐÐ! Ð¢Ð ÐÐÐ ÐÐÐÐ¢Ð!
-          \name[Shotgun]Alright, let's take a look around...	\name[Shotgun]Alright, let's take a look around...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢Ð°Ðº, Ð¾ÑÐ¼Ð¾ÑÑÐ¸Ð¼ÑÑâ¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢Ð°Ðº, ÑÐ¾Ð·Ð·Ð¸ÑÐ½ÑÐ¼Ð¾ÑÑâ¦
-          \name[Shotgun]This place looks very old. That floor 	\name[Shotgun]This place looks very old. That floor 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾ÑÐ¾Ð¶Ðµ, Ð·Ð´ÐµÑÑ Ð²ÑÑ Ð¾ÑÐµÐ½Ñ ÑÑÐ°ÑÐ¾Ðµ. ÐÐ¾Ð»	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡ÑÐ¾Ð¶Ðµ, ÑÑÑ ÑÑÐµ Ð´ÑÐ¶Ðµ ÑÑÐ°ÑÐµ. ÐÑÐ´Ð»Ð¾Ð³Ð°
-          up ahead looks like it could collapse at any moment...	up ahead looks like it could collapse at any moment...	Ð²Ð¿ÐµÑÐµÐ´Ð¸ Ð²Ð¾Ñ-Ð²Ð¾Ñ Ð¿ÑÐ¾Ð²Ð°Ð»Ð¸ÑÑÑâ¦	Ð¿Ð¾Ð¿ÐµÑÐµÐ´Ñ Ð¾Ñ-Ð¾Ñ Ð¿ÑÐ¾Ð²Ð°Ð»Ð¸ÑÑÑÑâ¦
-          \name[Shotgun]I need to find the files and get out 	\name[Shotgun]I need to find the files and get out 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°Ð´Ð¾ Ð½Ð°Ð¹ÑÐ¸ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÑ Ð¸ Ð¿Ð¾ÑÐºÐ¾ÑÐµÐµ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢ÑÐµÐ±Ð° Ð·Ð½Ð°Ð¹ÑÐ¸ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¸ Ð¹ ÑÐ²Ð¸Ð´ÑÐµ
-          quick. This place is already triggering my psychosis 	quick. This place is already triggering my psychosis 	Ð²ÑÐ±ÑÐ°ÑÑÑÑ. ÐÐ°Ð¶ÐµÑÑÑ, ÑÑÐ¾ Ð¼ÐµÑÑÐ¾ ÑÐ¶Ðµ	Ð²Ð¸Ð±ÑÐ°ÑÐ¸ÑÑ. ÐÐ´Ð°ÑÑÑÑÑ, ÑÐµ Ð¼ÑÑÑÐµ Ð²Ð¶Ðµ
-          by the look of it...	by the look of it...	Ð²ÑÐ·ÑÐ²Ð°ÐµÑ Ñ Ð¼ÐµÐ½Ñ Ð³Ð°Ð»Ð»ÑÑÐ¸Ð½Ð°ÑÐ¸Ð¸â¦	Ð²Ð¸ÐºÐ»Ð¸ÐºÐ°Ñ Ð² Ð¼ÐµÐ½Ðµ Ð³Ð°Ð»ÑÑÐ¸Ð½Ð°ÑÑÑâ¦
-          \name[Shotgun]I don't need to go back there.	\name[Shotgun]I don't need to go back there.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð·Ð²ÑÐ°ÑÐ°ÑÑÑÑ ÑÑÐ´Ð° Ð½ÐµÐ·Ð°ÑÐµÐ¼.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð²ÐµÑÑÐ°ÑÐ¸ÑÑ ÑÑÐ´Ð¸ Ð½ÐµÐ¼Ð° ÑÐ¾Ð³Ð¾.
-          \name[Shotgun]Needs a key.	\name[Shotgun]Needs a key.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÐ¶ÐµÐ½ ÐºÐ»ÑÑ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾ÑÑÑÐ±ÐµÐ½ ÐºÐ»ÑÑ.
-          \name[Shotgun]The files could be in here. I should 	\name[Shotgun]The files could be in here. I should 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾ÐºÑÐ¼ÐµÐ½ÑÑ Ð¼Ð¾Ð³ÑÑ Ð±ÑÑÑ Ð·Ð´ÐµÑÑ. ÐÐ°Ð´Ð¾	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾ÐºÑÐ¼ÐµÐ½ÑÐ¸ Ð¼Ð¾Ð¶ÑÑÑ Ð±ÑÑÐ¸ ÑÑÑ. Ð¢ÑÐµÐ±Ð°
-          check those other rooms for a key...	check those other rooms for a key...	Ð¿Ð¾Ð¸ÑÐºÐ°ÑÑ ÐºÐ»ÑÑ Ð² Ð´ÑÑÐ³Ð¸Ñ ÐºÐ¾Ð¼Ð½Ð°ÑÐ°Ñâ¦	Ð¿Ð¾ÑÑÐºÐ°ÑÐ¸ ÐºÐ»ÑÑ Ð² ÑÐ½ÑÐ¸Ñ ÐºÑÐ¼Ð½Ð°ÑÐ°Ñâ¦
-          You used the Security Room key	You used the Security Room key	ÐÑÐ¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°Ð½ ÐºÐ»ÑÑ Ð¾Ñ ÐºÐ¾Ð¼Ð½Ð°ÑÑ Ð¾ÑÑÐ°Ð½Ñ.	ÐÐ¸ÐºÐ¾ÑÐ¸ÑÑÐ°Ð½Ð¾ ÐºÐ»ÑÑ Ð²ÑÐ´ ÐºÑÐ¼Ð½Ð°ÑÐ¸ Ð¾ÑÐ¾ÑÐ¾Ð½Ð¸.
-          \name[Shotgun]This key won't fit this door.	\name[Shotgun]This key won't fit this door.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð­ÑÐ¾Ñ ÐºÐ»ÑÑ Ðº Ð´Ð²ÐµÑÐ¸ Ð½Ðµ Ð¿Ð¾Ð´ÑÐ¾Ð´Ð¸Ñ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¦ÐµÐ¹ ÐºÐ»ÑÑ Ð´Ð¾ Ð´Ð²ÐµÑÐµÐ¹ Ð½Ðµ Ð¿ÑÐ´ÑÐ¾Ð´Ð¸ÑÑ.
-          \name[Shotgun]I should check the storage room. The 	\name[Shotgun]I should check the storage room. The 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°Ð´Ð¾ Ð¿ÑÐ¾Ð²ÐµÑÐ¸ÑÑ ÐºÐ»Ð°Ð´Ð¾Ð²ÑÑ. ÐÐ»ÑÑ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢ÑÐµÐ±Ð° Ð¿ÐµÑÐµÐ²ÑÑÐ¸ÑÐ¸ ÐºÐ¾Ð¼Ð¾ÑÑ. ÐÐ»ÑÑ
-          key could be in there.	key could be in there.	Ð¼Ð¾Ð¶ÐµÑ Ð±ÑÑÑ ÑÐ°Ð¼.	Ð¼Ð¾Ð¶Ðµ Ð±ÑÑÐ¸ ÑÐ°Ð¼.
-          \name[Shotgun]What am i doing?! The files aren't 	\name[Shotgun]What am i doing?! The files aren't 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ° ÑÑÐ¾ Ñ Ð´ÐµÐ»Ð°Ñ?! ÐÐ¾ÐºÑÐ¼ÐµÐ½ÑÑ ÑÐ°Ð¼Ð¸	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢Ð° ÑÐ¾ Ñ ÑÐ¾Ð±Ð»Ñ?! ÐÐ¾ÐºÑÐ¼ÐµÐ½ÑÐ¸ ÑÐ°Ð¼Ñ
-          gonna magically appear in these chests if i keep 	gonna magically appear in these chests if i keep 	ÑÐ¾Ð±Ð¾Ð¹ Ð² ÑÑÐ¸Ñ ÑÑÐ¸ÐºÐ°Ñ Ð½Ðµ Ð¿Ð¾ÑÐ²ÑÑÑÑ,	ÑÐ¾Ð±Ð¾Ñ Ð² ÑÐ¸Ñ ÑÑÐ¸ÐºÐ°Ñ Ð½Ðµ Ð·'ÑÐ²Ð»ÑÑÑÑÑ,
-          searching them!	searching them!	ÑÐºÐ¾Ð»ÑÐºÐ¾ Ð½Ð¸ Ð¸ÑÐ¸!	ÑÐºÑÐ»ÑÐºÐ¸ Ð½Ðµ ÑÑÐºÐ°Ð¹!
-          \name[Shotgun]Junk, nothing useful in here.	\name[Shotgun]Junk, nothing useful in here.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ´Ð¸Ð½ ÑÐ»Ð°Ð¼. ÐÐ¸ÑÐµÐ³Ð¾ Ð¿Ð¾Ð»ÐµÐ·Ð½Ð¾Ð³Ð¾.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡Ð°Ð¼ Ð¼Ð¾ÑÐ»Ð¾Ñ. ÐÑÑÐ¾Ð³Ð¾ ÐºÐ¾ÑÐ¸ÑÐ½Ð¾Ð³Ð¾.
-          \name[Shotgun]There is nothing useful.	\name[Shotgun]There is nothing useful.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¸ÑÐµÐ³Ð¾ Ð¿Ð¾Ð»ÐµÐ·Ð½Ð¾Ð³Ð¾.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÑÐ¾Ð³Ð¾ ÐºÐ¾ÑÐ¸ÑÐ½Ð¾Ð³Ð¾.
-          \name[Shotgun]It's rusted...	\name[Shotgun]It's rusted...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÑ Ð¿ÑÐ¾ÑÐ¶Ð°Ð²ÐµÐ»Ð¾â¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð£ÑÐµ Ð¿ÑÐ¾ÑÑÐ¶Ð°Ð²ÑÐ»Ð¾â¦
-          \name[Shotgun]You wouldn't catch me touching that. 	\name[Shotgun]You wouldn't catch me touching that. 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ñ ÑÑÐ¾ Ñ ÑÑÐ¾Ð³Ð°ÑÑ ÑÐ¾ÑÐ½Ð¾ Ð½Ðµ Ð±ÑÐ´Ñ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÐµ Ñ ÑÐ¾ÑÐ½Ð¾ Ð½Ðµ ÑÑÐ¿Ð°ÑÐ¸Ð¼Ñ.
-          I don't want any nasty rust residue in my fur.	I don't want any nasty rust residue in my fur.	ÐÐµ ÑÐ¾ÑÑ Ð¿Ð¾ÑÐ¾Ð¼ Ð²ÑÑÑÑÑÐ²Ð°ÑÑ ÑÐ¶Ð°Ð²ÑÐ¸Ð½Ñ.	ÐÐµ ÑÐ¾ÑÑ Ð¿Ð¾ÑÑÐ¼ Ð²Ð¸ÑÑÑÑÐ²Ð°ÑÐ¸ ÑÑÐ¶Ñ.
-          You used the Storage Room Key	You used the Storage Room Key	ÐÑÐ¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°Ð½ ÐºÐ»ÑÑ Ð¾Ñ ÐºÐ»Ð°Ð´Ð¾Ð²Ð¾Ð¹.	ÐÐ¸ÐºÐ¾ÑÐ¸ÑÑÐ°Ð½Ð¾ ÐºÐ»ÑÑ Ð²ÑÐ´ ÐºÐ¾Ð¼Ð¾ÑÐ¸.
-          \name[Shotgun]Needs a key. One should be around 	\name[Shotgun]Needs a key. One should be around 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÐ¶ÐµÐ½ ÐºÐ»ÑÑ. ÐÐ½ Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±ÑÑÑ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾ÑÑÑÐ±ÐµÐ½ ÐºÐ»ÑÑ. ÐÑÐ½ Ð¼Ð°Ñ Ð±ÑÑÐ¸
-          here somewhere. Maybe I should check the room 	here somewhere. Maybe I should check the room 	Ð³Ð´Ðµ-ÑÐ¾ Ð¿Ð¾Ð±Ð»Ð¸Ð·Ð¾ÑÑÐ¸. ÐÐ¾Ð¶ÐµÑ, Ð¿ÑÐ¾Ð²ÐµÑÐ¸ÑÑ	Ð´ÐµÑÑ Ð¿Ð¾Ð±Ð»Ð¸Ð·Ñ. ÐÐ¾Ð¶Ðµ, Ð¿ÐµÑÐµÐ²ÑÑÐ¸ÑÐ¸
-          across from here...	across from here...	ÐºÐ¾Ð¼Ð½Ð°ÑÑ Ð½Ð°Ð¿ÑÐ¾ÑÐ¸Ð²â¦	ÐºÑÐ¼Ð½Ð°ÑÑ Ð½Ð°Ð²Ð¿ÑÐ¾ÑÐ¸â¦
-          \name[Shotgun]Jammed.	\name[Shotgun]Jammed.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°ÐºÐ»Ð¸Ð½Ð¸Ð»Ð¾.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°ÐºÐ»Ð¸Ð½Ð¸Ð»Ð¾.
-          \name[Shotgun]There is no power.	\name[Shotgun]There is no power.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐµÑ ÑÐ»ÐµÐºÑÑÐ¸ÑÐµÑÑÐ²Ð°.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐµÐ¼Ð°Ñ ÐµÐ»ÐµÐºÑÑÐ¸ÐºÐ¸.
-          \name[Shotgun]There's something in here...	\name[Shotgun]There's something in here...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢ÑÑ ÑÑÐ¾-ÑÐ¾ ÐµÑÑÑâ¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢ÑÑ ÑÐ¾ÑÑ Ñâ¦
-          Obtained Storage Room Key	Obtained Storage Room Key	ÐÐ¾Ð»ÑÑÐµÐ½ ÐºÐ»ÑÑ Ð¾Ñ ÐºÐ»Ð°Ð´Ð¾Ð²Ð¾Ð¹.	ÐÑÑÐ¸Ð¼Ð°Ð½Ð¾ ÐºÐ»ÑÑ Ð²ÑÐ´ ÐºÐ¾Ð¼Ð¾ÑÐ¸.
-          \name[Shotgun]I already got the key. I should use it on 	\name[Shotgun]I already got the key. I should use it on 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ»ÑÑ ÑÐ¶Ðµ Ñ Ð¼ÐµÐ½Ñ. ÐÐ°Ð´Ð¾ Ð¾ÑÐºÑÑÑÑ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ»ÑÑ ÑÐ¶Ðµ Ð² Ð¼ÐµÐ½Ðµ. Ð¢ÑÐµÐ±Ð° Ð²ÑÐ´ÑÐ¸Ð½Ð¸ÑÐ¸
-          the storage room door.	the storage room door.	Ð¸Ð¼ ÐºÐ»Ð°Ð´Ð¾Ð²ÑÑ.	Ð½Ð¸Ð¼ ÐºÐ¾Ð¼Ð¾ÑÑ.
-          Shotgun	Shotgun	Ð¨Ð¾ÑÐ³Ð°Ð½	Ð¨Ð¾ÑÐ³Ð°Ð½
-          "A old letter, nothing useful"	"A old letter, nothing useful"	Â«Ð¡ÑÐ°ÑÐ¾Ðµ Ð¿Ð¸ÑÑÐ¼Ð¾. ÐÐ¸ÑÐµÐ³Ð¾ Ð¿Ð¾Ð»ÐµÐ·Ð½Ð¾Ð³Ð¾Â».	Â«Ð¡ÑÐ°ÑÐ¸Ð¹ Ð»Ð¸ÑÑ. ÐÑÑÐ¾Ð³Ð¾ ÐºÐ¾ÑÐ¸ÑÐ½Ð¾Ð³Ð¾Â».
-          \name[Shotgun]Odd...	\name[Shotgun]Odd...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡ÑÑÐ°Ð½Ð½Ð¾â¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¸Ð²Ð½Ð¾â¦
-          \name[Shotgun]There's a photograph in 	\name[Shotgun]There's a photograph in 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð ÑÑÐ¾Ð¼ ÑÑÐ¸ÐºÐµ ÑÑÐ¾Ð»Ð° Ð»ÐµÐ¶Ð¸Ñ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð£ ÑÑÐ¹ ÑÑÑÐ»ÑÐ´Ñ ÑÑÐ¾Ð»Ñ Ð»ÐµÐ¶Ð¸ÑÑ
-          this desk drawer...	this desk drawer...	ÑÐ¾ÑÐ¾Ð³ÑÐ°ÑÐ¸Ñâ¦	ÑÐ¾ÑÐ¾Ð³ÑÐ°ÑÑÑâ¦
-          \name[Shotgun]Some kid in a purple jacket. The other 	\name[Shotgun]Some kid in a purple jacket. The other 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°ÐºÐ¾Ð¹-ÑÐ¾ Ð¿Ð°ÑÐµÐ½Ñ Ð² ÑÐ¸Ð¾Ð»ÐµÑÐ¾Ð²Ð¾Ð¹ ÐºÑÑÑÐºÐµ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ÐºÐ¸Ð¹ÑÑ ÑÐ»Ð¾Ð¿ÐµÑÑ Ñ ÑÑÐ¾Ð»ÐµÑÐ¾Ð²ÑÐ¹ ÐºÑÑÑÑÑ.
-          side has a text that reads Kolach Xonal	side has a text that reads Kolach Xonal	ÐÐ° Ð¾Ð±Ð¾ÑÐ¾ÑÐµ Ð½Ð°Ð¿Ð¸ÑÐ°Ð½Ð¾: Â«ÐÐ¾Ð»Ð°Ñ ÐÑÐ¾Ð½Ð°Ð»Â».	ÐÐ° Ð·Ð²Ð¾ÑÐ¾ÑÑ Ð½Ð°Ð¿Ð¸ÑÐ°Ð½Ð¾: Â«ÐÐ¾Ð»Ð°Ñ ÐÑÐ¾Ð½Ð°Ð»Â».
-          \name[Shotgun]Humans have been dead for a long 	\name[Shotgun]Humans have been dead for a long 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÐ´Ð¸ Ð´Ð°Ð²Ð½ÑÐ¼-Ð´Ð°Ð²Ð½Ð¾ Ð²ÑÐ¼ÐµÑÐ»Ð¸.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÐ´Ð¸ Ð´Ð°Ð²Ð½Ð¸Ð¼-Ð´Ð°Ð²Ð½Ð¾ Ð²Ð¸Ð¼ÐµÑÐ»Ð¸.
-          time. This must be very old.	time. This must be very old.	Ð­ÑÐ¾Ð¼Ñ ÑÐ¾ÑÐ¾, Ð½Ð°Ð²ÐµÑÐ½Ð¾Ðµ, Ð¼Ð½Ð¾Ð³Ð¾ Ð»ÐµÑ.	Ð¦ÑÐ¾Ð¼Ñ ÑÐ¾ÑÐ¾, Ð¼Ð°Ð±ÑÑÑ, Ð±Ð°Ð³Ð°ÑÐ¾ ÑÐ¾ÐºÑÐ².
-          \name[Shotgun]I'll take it with me...	\name[Shotgun]I'll take it with me...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°Ð±ÐµÑÑ ÐµÑ Ñ ÑÐ¾Ð±Ð¾Ð¹â¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°Ð±ÐµÑÑ ÑÑ ÑÐ· ÑÐ¾Ð±Ð¾Ñâ¦
-          Obtained Secret Photograph	Obtained Secret Photograph	ÐÐ¾Ð»ÑÑÐµÐ½Ð° ÑÐ°Ð¹Ð½Ð°Ñ ÑÐ¾ÑÐ¾Ð³ÑÐ°ÑÐ¸Ñ.	ÐÑÑÐ¸Ð¼Ð°Ð½Ð¾ ÑÐ°ÑÐ¼Ð½Ñ ÑÐ¾ÑÐ¾Ð³ÑÐ°ÑÑÑ.
-          COLLECTIBLE FOUND!	COLLECTIBLE FOUND!	ÐÐÐÐÐÐ ÐÐ ÐÐÐÐÐ¢ ÐÐÐÐÐÐÐ¦ÐÐ!	ÐÐÐÐÐÐÐÐ ÐÐÐÐÐÐ¦ÐÐÐÐÐ ÐÐ ÐÐÐÐÐ¢!
-          \name[Shotgun]Empty.	\name[Shotgun]Empty.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÑÑÐ¾.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾ÑÐ¾Ð¶Ð½ÑÐ¾.
-          \name[Shotgun]A old letter, nothing useful.	\name[Shotgun]A old letter, nothing useful.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡ÑÐ°ÑÐ¾Ðµ Ð¿Ð¸ÑÑÐ¼Ð¾. ÐÐ¸ÑÐµÐ³Ð¾ Ð¿Ð¾Ð»ÐµÐ·Ð½Ð¾Ð³Ð¾.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡ÑÐ°ÑÐ¸Ð¹ Ð»Ð¸ÑÑ. ÐÑÑÐ¾Ð³Ð¾ ÐºÐ¾ÑÐ¸ÑÐ½Ð¾Ð³Ð¾.
-          \name[Shotgun]This door leads to the stairs for the 	\name[Shotgun]This door leads to the stairs for the 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ° ÑÑÐ¾Ð¹ Ð´Ð²ÐµÑÑÑ Ð»ÐµÑÑÐ½Ð¸ÑÐ° Ð² Ð¿Ð¾Ð´Ð²Ð°Ð»	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ° ÑÐ¸Ð¼Ð¸ Ð´Ð²ÐµÑÐ¸Ð¼Ð° ÑÑÐ¾Ð´Ð¸ Ð² Ð¿ÑÐ´Ð²Ð°Ð»
-          basement and second floor...	basement and second floor...	Ð¸ Ð½Ð° Ð²ÑÐ¾ÑÐ¾Ð¹ ÑÑÐ°Ð¶â¦	Ñ Ð½Ð° Ð´ÑÑÐ³Ð¸Ð¹ Ð¿Ð¾Ð²ÐµÑÑâ¦
-          \name[Shotgun]It looks stuck but I could try	\name[Shotgun]It looks stuck but I could try	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°Ð¶ÐµÑÑÑ, ÐµÑ Ð·Ð°ÐºÐ»Ð¸Ð½Ð¸Ð»Ð¾, Ð½Ð¾ Ð¼Ð¾Ð¶Ð½Ð¾	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ´Ð°ÑÑÑÑÑ, ÑÑ Ð·Ð°ÐºÐ»Ð¸Ð½Ð¸Ð»Ð¾, Ð°Ð»Ðµ Ð¼Ð¾Ð¶Ð½Ð°
-          to open it...	to open it...	Ð¿Ð¾Ð¿ÑÐ¾Ð±Ð¾Ð²Ð°ÑÑ Ð¾ÑÐºÑÑÑÑâ¦	ÑÐ¿ÑÐ¾Ð±ÑÐ²Ð°ÑÐ¸ Ð²ÑÐ´ÑÐ¸Ð½Ð¸ÑÐ¸â¦
-          \name[Shotgun]Should I?	\name[Shotgun]Should I?	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð¿ÑÐ¾Ð±Ð¾Ð²Ð°ÑÑ?	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡Ð¿ÑÐ¾Ð±ÑÐ²Ð°ÑÐ¸?
-          Open it	Open it	ÐÑÐºÑÑÑÑ	ÐÑÐ´ÑÐ¸Ð½Ð¸ÑÐ¸
-          Don't	Don't	ÐÐµ Ð¾ÑÐºÑÑÐ²Ð°ÑÑ	ÐÐµ Ð²ÑÐ´ÑÐ¸Ð½ÑÑÐ¸
-          \name[Shotgun]Yeah this door isn't gonna open. It's 	\name[Shotgun]Yeah this door isn't gonna open. It's 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ° ÑÐ¶, ÑÑÑ Ð´Ð²ÐµÑÑ Ð½Ðµ Ð¾ÑÐºÑÑÑÑ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢Ð°Ðº, ÑÑ Ð´Ð²ÐµÑÑ Ð½Ðµ Ð²ÑÐ´ÑÐ¸Ð½Ð¸ÑÐ¸.
-          definitely stuck...	definitely stuck...	ÐÑ ÑÐ¾ÑÐ½Ð¾ Ð·Ð°ÐºÐ»Ð¸Ð½Ð¸Ð»Ð¾â¦	ÐÑ ÑÐ¾ÑÐ½Ð¾ Ð·Ð°ÐºÐ»Ð¸Ð½Ð¸Ð»Ð¾â¦
-          \name[Shotgun]I'll leave it for now	\name[Shotgun]I'll leave it for now	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾ÐºÐ° Ð¾ÑÑÐ°Ð²Ð»Ñ ÐºÐ°Ðº ÐµÑÑÑ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾ÐºÐ¸ Ð·Ð°Ð»Ð¸ÑÑ ÑÐº Ñ.
-          \name[Shotgun]I already tried to go in there. I can't 	\name[Shotgun]I already tried to go in there. I can't 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ ÑÐ¶Ðµ Ð¿ÑÑÐ°Ð»ÑÑ Ð¿Ð¾Ð¿Ð°ÑÑÑ ÑÑÐ´Ð°.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ Ð²Ð¶Ðµ Ð½Ð°Ð¼Ð°Ð³Ð°Ð²ÑÑ ÑÑÐ´Ð¸ Ð·Ð°Ð¹ÑÐ¸.
-          open it.	open it.	ÐÐ²ÐµÑÑ Ð½Ðµ Ð¾ÑÐºÑÑÑÑ.	ÐÐ²ÐµÑÑ Ð½Ðµ Ð²ÑÐ´ÑÐ¸Ð½Ð¸ÑÐ¸.
-          \name[Shotgun]Found it!	\name[Shotgun]Found it!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°ÑÑÐ»!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ½Ð°Ð¹ÑÐ¾Ð²!
-          \name[Shotgun]Ugh... My head hurts...	\name[Shotgun]Ugh... My head hurts...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð£Ñâ¦ ÐÐ¾Ð»Ð¾Ð²Ð° Ð±Ð¾Ð»Ð¸Ñâ¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð£Ñâ¦ ÐÐ¾Ð»Ð¾Ð²Ð° Ð±Ð¾Ð»Ð¸ÑÑâ¦
-          \name[???]HELLO SHOTGUN!	\name[???]HELLO SHOTGUN!	\name[???]ÐÐ ÐÐÐÐ¢, Ð¨ÐÐ¢ÐÐÐ!	\name[???]ÐÐ ÐÐÐÐ¢, Ð¨ÐÐ¢ÐÐÐÐ!
-          \name[Shotgun]?!	\name[Shotgun]?!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]?!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]?!
-          \name[Shotgun]What was that voice!?	\name[Shotgun]What was that voice!?	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð§ÑÐ¾ ÑÑÐ¾ Ð·Ð° Ð³Ð¾Ð»Ð¾Ñ?!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð©Ð¾ ÑÐµ Ð·Ð° Ð³Ð¾Ð»Ð¾Ñ?!
-          \name[Shotgun]..........	\name[Shotgun]..........	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]â¦â¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]â¦â¦
-          \name[Shotgun]Must be hearing things...	\name[Shotgun]Must be hearing things...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð»Ð¶Ð½Ð¾ Ð±ÑÑÑ, Ð¿Ð¾ÑÐ»ÑÑÐ°Ð»Ð¾ÑÑâ¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°Ð±ÑÑÑ, Ð¿Ð¾ÑÑÐ»Ð¾ÑÑâ¦
-          \name[Shotgun]Let's grab this key and go...	\name[Shotgun]Let's grab this key and go...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°Ð±ÐµÑÑ ÐºÐ»ÑÑ Ð¸ ÑÐ¹Ð´Ñâ¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°Ð±ÐµÑÑ ÐºÐ»ÑÑ Ñ Ð¿ÑÐ´Ñâ¦
-          Obtained Security Room Key	Obtained Security Room Key	ÐÐ¾Ð»ÑÑÐµÐ½ ÐºÐ»ÑÑ Ð¾Ñ ÐºÐ¾Ð¼Ð½Ð°ÑÑ Ð¾ÑÑÐ°Ð½Ñ.	ÐÑÑÐ¸Ð¼Ð°Ð½Ð¾ ÐºÐ»ÑÑ Ð²ÑÐ´ ÐºÑÐ¼Ð½Ð°ÑÐ¸ Ð¾ÑÐ¾ÑÐ¾Ð½Ð¸.
-          \name[Shotgun](My visions are getting the best of 	\name[Shotgun](My visions are getting the best of 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½](ÐÐ°Ð»Ð»ÑÑÐ¸Ð½Ð°ÑÐ¸Ð¸ Ð±ÐµÑÑÑ Ð²ÐµÑÑ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½](ÐÐ°Ð»ÑÑÐ¸Ð½Ð°ÑÑÑ Ð±ÐµÑÑÑÑ Ð³Ð¾ÑÑ.
-          me. Stay calm Shotgun...)	me. Stay calm Shotgun...)	Ð¡Ð¿Ð¾ÐºÐ¾Ð¹Ð½Ð¾, Ð¨Ð¾ÑÐ³Ð°Ð½â¦)	Ð¡Ð¿Ð¾ÐºÑÐ¹Ð½Ð¾, Ð¨Ð¾ÑÐ³Ð°Ð½Ðµâ¦)
-          \name[Shotgun](Just gotta get the files	\name[Shotgun](Just gotta get the files	\name[Ð¨Ð¾ÑÐ³Ð°Ð½](ÐÐ°Ð´Ð¾ Ð½Ð°Ð¹ÑÐ¸ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÑ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½](Ð¢ÑÐµÐ±Ð° Ð·Ð½Ð°Ð¹ÑÐ¸ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¸
-          and get out...)	and get out...)	Ð¸ ÑÐ¹ÑÐ¸â¦)	Ñ Ð¿ÑÑÐ¸â¦)
-          \name[Shotgun]Just trash in here.	\name[Shotgun]Just trash in here.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢ÑÑ Ð¾Ð´Ð¸Ð½ Ð¼ÑÑÐ¾Ñ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢ÑÑ ÑÐ°Ð¼Ðµ ÑÐ¼ÑÑÑÑ.
-          \name[Shotgun]Got it! Let's get inside.	\name[Shotgun]Got it! Let's get inside.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°ÑÑÐ»! ÐÐ¾ÑÐ° Ð²Ð½ÑÑÑÑ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ½Ð°Ð¹ÑÐ¾Ð²! Ð§Ð°Ñ ÑÑÐµÑÐµÐ´Ð¸Ð½Ñ.
-          Obtained Main Door key	Obtained Main Door key	ÐÐ¾Ð»ÑÑÐµÐ½ ÐºÐ»ÑÑ Ð¾Ñ Ð³Ð»Ð°Ð²Ð½Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ð°.	ÐÑÑÐ¸Ð¼Ð°Ð½Ð¾ ÐºÐ»ÑÑ Ð²ÑÐ´ Ð³Ð¾Ð»Ð¾Ð²Ð½Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ñ.
-          You used the Main Door Key	You used the Main Door Key	ÐÑÐ¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°Ð½ ÐºÐ»ÑÑ Ð¾Ñ Ð³Ð»Ð°Ð²Ð½Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ð°.	ÐÐ¸ÐºÐ¾ÑÐ¸ÑÑÐ°Ð½Ð¾ ÐºÐ»ÑÑ Ð²ÑÐ´ Ð³Ð¾Ð»Ð¾Ð²Ð½Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ñ.
-          \name[Shotgun]I need a key. I should try looking 	\name[Shotgun]I need a key. I should try looking 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÐ¶ÐµÐ½ ÐºÐ»ÑÑ. ÐÐ¾Ð¿ÑÐ¾Ð±ÑÑ Ð¿Ð¾Ð¸ÑÐºÐ°ÑÑ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾ÑÑÑÐ±ÐµÐ½ ÐºÐ»ÑÑ. Ð¡Ð¿ÑÐ¾Ð±ÑÑ Ð¿Ð¾ÑÑÐºÐ°ÑÐ¸
-          around for one...	around for one...	ÐµÐ³Ð¾ Ð¿Ð¾Ð±Ð»Ð¸Ð·Ð¾ÑÑÐ¸â¦	Ð¹Ð¾Ð³Ð¾ Ð¿Ð¾Ð±Ð»Ð¸Ð·Ñâ¦
-          \name[Shotgun]I'm here...	\name[Shotgun]I'm here...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ Ð½Ð° Ð¼ÐµÑÑÐµâ¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ Ð½Ð° Ð¼ÑÑÑÑâ¦
-          \name[Boss]Radio check, Shotgun do	\name[Boss]Radio check, Shotgun do	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÑÐ¾Ð²ÐµÑÐºÐ° ÑÐ²ÑÐ·Ð¸. Ð¨Ð¾ÑÐ³Ð°Ð½,	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐµÑÐµÐ²ÑÑÐºÐ° Ð·Ð²'ÑÐ·ÐºÑ. Ð¨Ð¾ÑÐ³Ð°Ð½Ðµ,
-          you copy? Over.	you copy? Over.	ÐºÐ°Ðº ÑÐ»ÑÑÐ¸ÑÑ? ÐÑÐ¸ÑÐ¼.	ÑÐº ÑÑÑÑ? ÐÑÐ¸Ð¹Ð¾Ð¼.
-          \name[Shotgun]10-4, over.	\name[Shotgun]10-4, over.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡Ð»ÑÑÑ ÑÐ¾ÑÐ¾ÑÐ¾. ÐÑÐ¸ÑÐ¼.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð§ÑÑ Ð´Ð¾Ð±ÑÐµ. ÐÑÐ¸Ð¹Ð¾Ð¼.
-          \name[Shotgun]I have arrived at the target 	\name[Shotgun]I have arrived at the target 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ Ð¿ÑÐ¸Ð±ÑÐ» Ð² Ð½Ð°Ð·Ð½Ð°ÑÐµÐ½Ð½ÑÑ ÑÐ¾ÑÐºÑ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ Ð¿ÑÐ¸Ð±ÑÐ² Ð´Ð¾ Ð¿ÑÐ¸Ð·Ð½Ð°ÑÐµÐ½Ð¾Ñ ÑÐ¾ÑÐºÐ¸.
-          destination, over.	destination, over.	ÐÑÐ¸ÑÐ¼.	ÐÑÐ¸Ð¹Ð¾Ð¼.
-          \name[Boss]Good, power there is gone, so cameras 	\name[Boss]Good, power there is gone, so cameras 	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]Ð¥Ð¾ÑÐ¾ÑÐ¾. Ð¢Ð°Ð¼ Ð½ÐµÑ ÑÐ»ÐµÐºÑÑÐ¸ÑÐµÑÑÐ²Ð°,	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐ¾Ð±ÑÐµ. Ð¢Ð°Ð¼ Ð½ÐµÐ¼Ð°Ñ ÐµÐ»ÐµÐºÑÑÐ¸ÐºÐ¸,
-          won't be a problem, over.	won't be a problem, over.	ÐºÐ°Ð¼ÐµÑÑ Ð½Ðµ Ð¿Ð¾Ð¼ÐµÑÐ°ÑÑ. ÐÑÐ¸ÑÐ¼.	ÐºÐ°Ð¼ÐµÑÐ¸ Ð½Ðµ Ð·Ð°Ð²Ð°Ð´ÑÑÑ. ÐÑÐ¸Ð¹Ð¾Ð¼.
-          \name[Boss]Watch out for infected, get the files and 	\name[Boss]Watch out for infected, get the files and 	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐµÑÐµÐ³Ð¸ÑÑ Ð·Ð°ÑÐ°Ð¶ÑÐ½Ð½ÑÑ, Ð·Ð°Ð±ÐµÑÐ¸	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]Ð¡ÑÐµÑÐµÐ¶Ð¸ÑÑ Ð·Ð°ÑÐ°Ð¶ÐµÐ½Ð¸Ñ, Ð·Ð°Ð±ÐµÑÐ¸
-          get out. Over.	get out. Over.	Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÑ Ð¸ ÑÑÐ¾Ð´Ð¸. ÐÑÐ¸ÑÐ¼.	Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¸ Ð¹ Ð²Ð¸ÑÐ¾Ð´Ñ. ÐÑÐ¸Ð¹Ð¾Ð¼.
-          \name[Shotgun]Yes sir, over.	\name[Shotgun]Yes sir, over.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢Ð°Ðº ÑÐ¾ÑÐ½Ð¾. ÐÑÐ¸ÑÐ¼.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢Ð°Ðº ÑÐ¾ÑÐ½Ð¾. ÐÑÐ¸Ð¹Ð¾Ð¼.
-          \name[Shotgun]So this is the place? Looks old and 	\name[Shotgun]So this is the place? Looks old and 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ½Ð°ÑÐ¸Ñ, ÑÑÐ¾ Ð·Ð´ÐµÑÑ? ÐÐµÑÑÐ¾ ÑÑÐ°ÑÐ¾Ðµ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÐ¶Ðµ, ÑÐµ ÑÑÑ? ÐÑÑÑÐµ ÑÑÐ°ÑÐµ
-          creepy. Let's find the entrance...	creepy. Let's find the entrance...	Ð¸ Ð¶ÑÑÐºÐ¾Ðµ. ÐÐ°Ð´Ð¾ Ð½Ð°Ð¹ÑÐ¸ Ð²ÑÐ¾Ð´â¦	Ñ Ð¼Ð¾ÑÐ¾ÑÐ¾ÑÐ½Ðµ. Ð¢ÑÐµÐ±Ð° Ð·Ð½Ð°Ð¹ÑÐ¸ Ð²ÑÑÐ´â¦
-          \name[CONTROLS][Arrow Keys] To move	\name[CONTROLS][Arrows] Move	\name[Ð£ÐÐ ÐÐÐÐÐÐÐ][Ð¡ÑÑÐµÐ»ÐºÐ¸] ÐÐ²Ð¸Ð¶ÐµÐ½Ð¸Ðµ	\name[ÐÐÐ Ð£ÐÐÐÐÐ¯][Ð¡ÑÑÑÐ»ÐºÐ¸] Ð ÑÑ
-          [Space / Enter] To interact	[OK] Interact	[OK] ÐÐ·Ð°Ð¸Ð¼Ð¾Ð´ÐµÐ¹ÑÑÐ²Ð¸Ðµ	[OK] ÐÐ·Ð°ÑÐ¼Ð¾Ð´ÑÑ
-          [Alt + Enter] Fullscreen	[BACK] Back / Pause	[ÐÐ°Ð·Ð°Ð´] ÐÐ°ÑÐ·Ð°	[ÐÐ°Ð·Ð°Ð´] ÐÐ°ÑÐ·Ð°
-          \name[Shotgun]I NEED TO GET OUT OF HERE!	\name[Shotgun]I NEED TO GET OUT OF HERE!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐÐ ÐÐ£ÐÐÐ ÐÐ«ÐÐ ÐÐ¢Ð¬Ð¡Ð¯ ÐÐ¢Ð¡Ð®ÐÐ!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐÐÐ Ð¢Ð ÐÐÐ ÐÐÐÐ ÐÐ¢ÐÐ¡Ð¯ ÐÐÐÐÐ¡Ð!
-          \name[Shotgun]THANK GOD!	\name[Shotgun]THANK GOD!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡ÐÐÐÐ ÐÐÐÐ£!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡ÐÐÐÐ ÐÐÐÐ£!
-          \name[Shotgun]That was too close!	\name[Shotgun]That was too close!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð§ÑÑÑ Ð½Ðµ Ð¿Ð¾Ð¿Ð°Ð»ÑÑ!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐµÐ´Ñ Ð½Ðµ Ð¿Ð¾Ð¿Ð°Ð²ÑÑ!
-          \name[Shotgun]Now how do I get out!?	\name[Shotgun]Now how do I get out!?	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð ÐºÐ°Ðº ÑÐµÐ¿ÐµÑÑ Ð¾ÑÑÑÐ´Ð° Ð²ÑÐ±ÑÐ°ÑÑÑÑ?!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð ÑÐº ÑÐµÐ¿ÐµÑ Ð·Ð²ÑÐ´ÑÐ¸ Ð²Ð¸Ð±ÑÐ°ÑÐ¸ÑÑ?!
-          \name[Shotgun]There has to be another exit...	\name[Shotgun]There has to be another exit...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð»Ð¶ÐµÐ½ Ð±ÑÑÑ Ð´ÑÑÐ³Ð¾Ð¹ Ð²ÑÑÐ¾Ð´â¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°Ñ Ð±ÑÑÐ¸ ÑÐ½ÑÐ¸Ð¹ Ð²Ð¸ÑÑÐ´â¦
-          This mission was already starting to go wrong...	This mission was already starting to go wrong...	ÐÐ¿ÐµÑÐ°ÑÐ¸Ñ ÑÐ¶Ðµ Ð¿Ð¾ÑÐ»Ð° Ð½Ðµ Ð¿Ð¾ Ð¿Ð»Ð°Ð½Ñâ¦	ÐÐ¿ÐµÑÐ°ÑÑÑ Ð²Ð¶Ðµ Ð¿ÑÑÐ»Ð° Ð½Ðµ Ð·Ð° Ð¿Ð»Ð°Ð½Ð¾Ð¼â¦
-          A hallucination from Shotgun's stress was bad 	A hallucination from Shotgun's stress was bad 	Ð£ Ð¨Ð¾ÑÐ³Ð°Ð½Ð° Ð¾Ñ ÑÑÑÐµÑÑÐ° Ð½Ð°ÑÐ°Ð»Ð¸ÑÑ	Ð£ Ð¨Ð¾ÑÐ³Ð°Ð½Ð° Ð²ÑÐ´ ÑÑÑÐµÑÑ Ð¿Ð¾ÑÐ°Ð»Ð¸ÑÑ
-          enough. Not to mention a Newborn, but there was a 	enough. Not to mention a Newborn, but there was a 	Ð³Ð°Ð»Ð»ÑÑÐ¸Ð½Ð°ÑÐ¸Ð¸, Ð´Ð° ÐµÑÑ Ð¸ ÐÐ¾Ð²Ð¾ÑÐ¾Ð¶Ð´ÑÐ½Ð½ÑÐ¹.	Ð³Ð°Ð»ÑÑÐ¸Ð½Ð°ÑÑÑ, Ð° ÑÐµ ÑÐµÐ¹ ÐÐ¾Ð²Ð¾Ð½Ð°ÑÐ¾Ð´Ð¶ÐµÐ½Ð¸Ð¹.
-          bigger problem...	bigger problem...	ÐÐ¾ Ð±ÑÐ»Ð° Ð¿ÑÐ¾Ð±Ð»ÐµÐ¼Ð° Ð¿Ð¾ÑÐµÑÑÑÐ·Ð½ÐµÐµâ¦	ÐÐ»Ðµ Ð±ÑÐ»Ð° Ð¿ÑÐ¾Ð±Ð»ÐµÐ¼Ð° ÑÐµÑÐ¹Ð¾Ð·Ð½ÑÑÐ°â¦
-          The floor near the exit had collapsed due to mold. 	The floor near the exit had collapsed due to mold. 	ÐÐ¾Ð» Ð²Ð¾Ð·Ð»Ðµ Ð²ÑÑÐ¾Ð´Ð° Ð¿ÑÐ¾Ð³Ð½Ð¸Ð» Ð¸ Ð¾Ð±Ð²Ð°Ð»Ð¸Ð»ÑÑ.	ÐÑÐ¾Ð³Ð½Ð¸Ð»Ð° Ð¹ Ð¾Ð±Ð²Ð°Ð»Ð¸Ð»Ð°ÑÑ Ð¿ÑÐ´Ð»Ð¾Ð³Ð° Ð±ÑÐ»Ñ Ð²Ð¸ÑÐ¾Ð´Ñ.
-          Leaving Shotgun trapped and needing another exit...	Leaving Shotgun trapped and needing another exit...	Ð¨Ð¾ÑÐ³Ð°Ð½Ñ Ð½ÑÐ¶ÐµÐ½ Ð±ÑÐ» Ð´ÑÑÐ³Ð¾Ð¹ Ð²ÑÑÐ¾Ð´â¦	Ð¨Ð¾ÑÐ³Ð°Ð½Ñ Ð´Ð¾Ð²ÐµÐ»Ð¾ÑÑ ÑÑÐºÐ°ÑÐ¸ ÑÐ½ÑÐ¸Ð¹ Ð²Ð¸ÑÑÐ´â¦
-          As Shotgun walked through the dark... Looking for a 	As Shotgun walked through the dark... Looking for a 	ÐÑÐ¾Ð±Ð¸ÑÐ°ÑÑÑ ÑÐºÐ²Ð¾Ð·Ñ ÑÐµÐ¼Ð½Ð¾ÑÑ	ÐÑÐ¾Ð±Ð¸ÑÐ°ÑÑÐ¸ÑÑ ÐºÑÑÐ·Ñ ÑÐµÐ¼ÑÑÐ²Ñ
-          way out...	way out...	Ð² Ð¿Ð¾Ð¸ÑÐºÐ°Ñ Ð²ÑÑÐ¾Ð´Ð°â¦	Ñ Ð¿Ð¾ÑÑÐºÐ°Ñ Ð²Ð¸ÑÐ¾Ð´Ñâ¦
-          He would soon discover that this mission...	He would soon discover that this mission...	Ð¨Ð¾ÑÐ³Ð°Ð½ ÑÐºÐ¾ÑÐ¾ Ð¿Ð¾Ð¹Ð¼ÑÑ, ÑÑÐ¾ ÑÑÐ° Ð¼Ð¸ÑÑÐ¸Ñâ¦	Ð¨Ð¾ÑÐ³Ð°Ð½ ÑÐºÐ¾ÑÐ¾ Ð·ÑÐ¾Ð·ÑÐ¼ÑÑ, ÑÐ¾ ÑÑ Ð¼ÑÑÑÑâ¦
-          Is easier said than done...	Is easier said than done...	ÐÐµÐ³ÐºÐ° ÑÐ¾Ð»ÑÐºÐ¾ Ð½Ð° ÑÐ»Ð¾Ð²Ð°Ñâ¦	ÐÐµÐ³ÐºÐ° ÑÑÐ»ÑÐºÐ¸ Ð½Ð° ÑÐ»Ð¾Ð²Ð°Ñâ¦
-          What will happen to Shotgun?	What will happen to Shotgun?	Ð§ÑÐ¾ Ð¶Ðµ Ð±ÑÐ´ÐµÑ Ñ Ð¨Ð¾ÑÐ³Ð°Ð½Ð¾Ð¼?	Ð©Ð¾ Ð¶ Ð±ÑÐ´Ðµ ÑÐ· Ð¨Ð¾ÑÐ³Ð°Ð½Ð¾Ð¼?
-          Will he find another exit?	Will he find another exit?	ÐÐ°Ð¹Ð´ÑÑ Ð»Ð¸ Ð¾Ð½ Ð´ÑÑÐ³Ð¾Ð¹ Ð²ÑÑÐ¾Ð´?	Ð§Ð¸ Ð·Ð½Ð°Ð¹Ð´Ðµ Ð²ÑÐ½ ÑÐ½ÑÐ¸Ð¹ Ð²Ð¸ÑÑÐ´?
-          Or is his fate now sealed?	Or is his fate now sealed?	ÐÐ»Ð¸ ÐµÐ³Ð¾ ÑÑÐ´ÑÐ±Ð° ÑÐ¶Ðµ ÑÐµÑÐµÐ½Ð°?	Ð§Ð¸ Ð¹Ð¾Ð³Ð¾ Ð´Ð¾Ð»Ñ Ð²Ð¶Ðµ Ð²Ð¸ÑÑÑÐµÐ½Ð°?
-                                            - Prologue -                                  	                                  - Prologue -                                  	â ÐÑÐ¾Ð»Ð¾Ð³ â	â ÐÑÐ¾Ð»Ð¾Ð³ â
-                                               The Call                                 	                                     The Call                                 	ÐÑÐ·Ð¾Ð²	ÐÐ¸ÐºÐ»Ð¸Ðº
-                                                [ END ]     	                                      [ END ]     	[ ÐÐÐÐÐ¦ ]	[ ÐÐÐÐÐ¦Ð¬ ]
-          Thank you for playing this demo!	Thank you for playing this demo!	Ð¡Ð¿Ð°ÑÐ¸Ð±Ð¾, ÑÑÐ¾ ÑÑÐ³ÑÐ°Ð»Ð¸ Ð² Ð´ÐµÐ¼Ð¾!	ÐÑÐºÑÑÐ¼Ð¾, ÑÐ¾ Ð·ÑÐ³ÑÐ°Ð»Ð¸ Ð² Ð´ÐµÐ¼Ð¾!
-          Stay tuned for the release of chapter 1!	Stay tuned for the release of chapter 1!	Ð¡Ð»ÐµÐ´Ð¸ÑÐµ Ð·Ð° Ð²ÑÑÐ¾Ð´Ð¾Ð¼ Ð¿ÐµÑÐ²Ð¾Ð¹ Ð³Ð»Ð°Ð²Ñ!	Ð¡ÑÐµÐ¶ÑÐµ Ð·Ð° Ð²Ð¸ÑÐ¾Ð´Ð¾Ð¼ Ð¿ÐµÑÑÐ¾Ð³Ð¾ ÑÐ¾Ð·Ð´ÑÐ»Ñ!
-          Hello there! Two things to mention.	Hello there! Two things to mention.	ÐÑÐ¸Ð²ÐµÑ! Ð¡Ð½Ð°ÑÐ°Ð»Ð° Ð´Ð²Ð° Ð·Ð°Ð¼ÐµÑÐ°Ð½Ð¸Ñ.	ÐÑÐ¸Ð²ÑÑ! Ð¡Ð¿Ð¾ÑÐ°ÑÐºÑ Ð´Ð²Ð° Ð·Ð°ÑÐ²Ð°Ð¶ÐµÐ½Ð½Ñ.
-          First, this game is not canon to the original 	First, this game is not canon to the original 	ÐÐ¾-Ð¿ÐµÑÐ²ÑÑ, Ð¸ÑÑÐ¾ÑÐ¸Ñ ÑÑÐ¾Ð¹ Ð¸Ð³ÑÑ	ÐÐ¾-Ð¿ÐµÑÑÐµ, ÑÑÑÐ¾ÑÑÑ ÑÑÑÑ Ð³ÑÐ¸
-          Slendytubbies lore and most of its characters are 	Slendytubbies lore and most of its characters are 	Ð²Ð½Ðµ ÐºÐ°Ð½Ð¾Ð½Ð° Slendytubbies. ÐÐ¾Ð»ÑÑÐ¸Ð½ÑÑÐ²Ð¾	Ð¿Ð¾Ð·Ð° ÐºÐ°Ð½Ð¾Ð½Ð¾Ð¼ Slendytubbies. ÐÑÐ»ÑÑÑÑÑÑ
-          original.	original.	Ð¿ÐµÑÑÐ¾Ð½Ð°Ð¶ÐµÐ¹ Ð¿ÑÐ¸Ð´ÑÐ¼Ð°Ð½Ñ Ð´Ð»Ñ Ð½ÐµÑ.	Ð¿ÐµÑÑÐ¾Ð½Ð°Ð¶ÑÐ² ÑÑÐ²Ð¾ÑÐµÐ½Ñ Ð´Ð»Ñ Ð½ÐµÑ.
-          Second, this game goes by a prologue and 5 	Second, this game goes by a prologue and 5 	ÐÐ¾-Ð²ÑÐ¾ÑÑÑ, Ð² Ð¸Ð³ÑÐµ Ð¿ÑÐ¾Ð»Ð¾Ð³ Ð¸	ÐÐ¾-Ð´ÑÑÐ³Ðµ, Ñ Ð³ÑÑ Ð¿ÑÐ¾Ð»Ð¾Ð³ Ñ
-          chapters.	chapters.	Ð¿ÑÑÑ Ð³Ð»Ð°Ð².	Ð¿'ÑÑÑ ÑÐ¾Ð·Ð´ÑÐ»ÑÐ².
-          At the end of each chapter you will be prompted to 	At the end of each chapter you will be prompted to 	Ð ÐºÐ¾Ð½ÑÐµ ÐºÐ°Ð¶Ð´Ð¾Ð¹ Ð³Ð»Ð°Ð²Ñ Ð²Ð°Ð¼ Ð¿ÑÐµÐ´Ð»Ð¾Ð¶Ð°Ñ	Ð£ ÐºÑÐ½ÑÑ ÐºÐ¾Ð¶Ð½Ð¾Ð³Ð¾ ÑÐ¾Ð·Ð´ÑÐ»Ñ Ð²Ð°Ð¼ Ð·Ð°Ð¿ÑÐ¾Ð¿Ð¾Ð½ÑÑÑÑ
-          save your progress.	save your progress.	ÑÐ¾ÑÑÐ°Ð½Ð¸ÑÑ Ð¿ÑÐ¾Ð³ÑÐµÑÑ.	Ð·Ð±ÐµÑÐµÐ³ÑÐ¸ Ð¿ÑÐ¾Ð³ÑÐµÑ.
-          Don't worry as you can save almost anytime!	Don't worry as you can save almost anytime!	Ð¡Ð¾ÑÑÐ°Ð½ÑÑÑÑÑ Ð¼Ð¾Ð¶Ð½Ð¾ Ð¿Ð¾ÑÑÐ¸ Ð²ÑÐµÐ³Ð´Ð°!	ÐÐ±ÐµÑÑÐ³Ð°ÑÐ¸ÑÑ Ð¼Ð¾Ð¶Ð½Ð° Ð¼Ð°Ð¹Ð¶Ðµ Ð·Ð°Ð²Ð¶Ð´Ð¸!
-          With that said...	With that said...	Ð ÑÐµÐ¿ÐµÑÑâ¦	Ð ÑÐµÐ¿ÐµÑâ¦
-          Let's begin this story now...	Let's begin this story now...	ÐÐ°ÑÐ½ÑÐ¼ ÑÑÑ Ð¸ÑÑÐ¾ÑÐ¸Ñâ¦	ÐÐ¾ÑÐ½ÑÐ¼Ð¾ ÑÑ ÑÑÑÐ¾ÑÑÑâ¦
-                                            - Prologue -	                                  - Prologue -	â ÐÑÐ¾Ð»Ð¾Ð³ â	â ÐÑÐ¾Ð»Ð¾Ð³ â
-                                               The Call	                                     The Call	ÐÑÐ·Ð¾Ð²	ÐÐ¸ÐºÐ»Ð¸Ðº
-                             [Guardian's base - 12:50 P.M]	                   [Guardian's base - 12:50 P.M]	[ÐÐ°Ð·Ð° Ð¡ÑÑÐ°Ð¶ÐµÐ¹ â 12:50]	[ÐÐ°Ð·Ð° ÐÐ°ÑÑÐ¾Ð²Ð¸Ñ â 12:50]
-          \name[Shotgun]Collection Guardian Unit Shotgun 	\name[Shotgun]Collection Guardian Unit Shotgun 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¨Ð¾ÑÐ³Ð°Ð½ Ð¸Ð· Ð¾ÑÑÑÐ´Ð° Ð¡ÑÑÐ°Ð¶ÐµÐ¹-ÑÐ±Ð¾ÑÑÐ¸ÐºÐ¾Ð²	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¨Ð¾ÑÐ³Ð°Ð½ ÑÐ· Ð·Ð°Ð³Ð¾Ð½Ñ ÐÐ°ÑÑÐ¾Ð²Ð¸Ñ-Ð·Ð±Ð¸ÑÐ°ÑÑÐ²
-          reporting for duty.	reporting for duty.	Ð¿ÑÐ¸Ð±ÑÐ» Ð¿Ð¾ Ð²Ð°ÑÐµÐ¼Ñ Ð¿ÑÐ¸ÐºÐ°Ð·Ñ.	Ð¿ÑÐ¸Ð±ÑÐ² Ð·Ð° Ð²Ð°ÑÐ¸Ð¼ Ð½Ð°ÐºÐ°Ð·Ð¾Ð¼.
-          \name[Shotgun]You said you wanted to see me, sir?	\name[Shotgun]You said you wanted to see me, sir?	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑ ÑÐ¾ÑÐµÐ»Ð¸ Ð¼ÐµÐ½Ñ Ð²Ð¸Ð´ÐµÑÑ, ÑÑÑ?	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¸ ÑÐ¾ÑÑÐ»Ð¸ Ð¼ÐµÐ½Ðµ Ð±Ð°ÑÐ¸ÑÐ¸, ÑÐµÑ?
-          \name[Boss]Yes, I have work for you...	\name[Boss]Yes, I have work for you...	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐ°, Ñ Ð¼ÐµÐ½Ñ ÐµÑÑÑ Ð´Ð»Ñ ÑÐµÐ±Ñ ÑÐ°Ð±Ð¾ÑÐ°â¦	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]Ð¢Ð°Ðº, Ñ Ð¼ÐµÐ½Ðµ Ñ Ð´Ð»Ñ ÑÐµÐ±Ðµ ÑÐ¾Ð±Ð¾ÑÐ°â¦
-          \name[Shotgun]What now? More custards to 	\name[Shotgun]What now? More custards to 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð§ÑÐ¾ Ð½Ð° ÑÑÐ¾Ñ ÑÐ°Ð·? Ð¡Ð½Ð¾Ð²Ð° ÑÐ¾Ð±Ð¸ÑÐ°ÑÑ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð©Ð¾ ÑÑÐ¾Ð³Ð¾ ÑÐ°Ð·Ñ? ÐÐ½Ð¾Ð²Ñ Ð·Ð±Ð¸ÑÐ°ÑÐ¸
-          collect again?	collect again?	Ð·Ð°Ð²Ð°ÑÐ½Ð¾Ð¹ ÐºÑÐµÐ¼?	Ð·Ð°Ð²Ð°ÑÐ½Ð¸Ð¹ ÐºÑÐµÐ¼?
-          \name[Boss]No.	\name[Boss]No.	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐµÑ.	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÑ.
-          \name[Boss]Something different.	\name[Boss]Something different.	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐ¾Ðµ-ÑÑÐ¾ Ð´ÑÑÐ³Ð¾Ðµ.	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐµÑÐ¾ ÑÐ½ÑÐµ.
-          \name[Boss]There is an old C.O.A.T. facility not far 	\name[Boss]There is an old C.O.A.T. facility not far 	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐµÐ´Ð°Ð»ÐµÐºÐ¾ Ð¾ÑÑÑÐ´Ð° ÐµÑÑÑ ÑÑÐ°ÑÑÐ¹	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐµÐ´Ð°Ð»ÐµÐºÐ¾ Ð·Ð²ÑÐ´ÑÐ¸ Ñ ÑÑÐ°ÑÐ¸Ð¹
-          from here...	from here...	Ð¾Ð±ÑÐµÐºÑ C.O.A.T.â¦	Ð¾Ð±'ÑÐºÑ C.O.A.T.â¦
-          \name[Boss]I heard reports from another C.G. that 	\name[Boss]I heard reports from another C.G. that 	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÑÑÐ³Ð¾Ð¹ Ð¡ÑÑÐ°Ð¶-ÑÐ±Ð¾ÑÑÐ¸Ðº Ð´Ð¾Ð»Ð¾Ð¶Ð¸Ð»,	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐ½ÑÐ¸Ð¹ ÐÐ°ÑÑÐ¾Ð²Ð¸Ð¹-Ð·Ð±Ð¸ÑÐ°Ñ Ð´Ð¾Ð¿Ð¾Ð²ÑÐ²,
-          there is something helpful there...	there is something helpful there...	ÑÑÐ¾ ÑÐ°Ð¼ ÐµÑÑÑ ÐºÐ¾Ðµ-ÑÑÐ¾ Ð¿Ð¾Ð»ÐµÐ·Ð½Ð¾Ðµâ¦	ÑÐ¾ ÑÐ°Ð¼ Ñ Ð´ÐµÑÐ¾ ÐºÐ¾ÑÐ¸ÑÐ½Ðµâ¦
-          \name[Boss]That helpful item is top secret files...	\name[Boss]That helpful item is top secret files...	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]Ð¢Ð°Ð¼ Ð»ÐµÐ¶Ð°Ñ ÑÐµÐºÑÐµÑÐ½ÑÐµ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÑâ¦	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]Ð¢Ð°Ð¼ Ð»ÐµÐ¶Ð°ÑÑ ÑÑÐ»ÐºÐ¾Ð¼ ÑÐ°ÑÐ¼Ð½Ñ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¸â¦
-          \name[Boss]Your mission is simple, go to the facility, 	\name[Boss]Your mission is simple, go to the facility, 	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐ°Ð´Ð°ÑÐ° Ð¿ÑÐ¾ÑÑÐ°Ñ. ÐÐ´Ð¸ Ð½Ð° Ð¾Ð±ÑÐµÐºÑ,	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐ°Ð²Ð´Ð°Ð½Ð½Ñ Ð¿ÑÐ¾ÑÑÐµ. ÐÐ´Ð¸ Ð½Ð° Ð¾Ð±'ÑÐºÑ,
-          find the files, and bring them to me...	find the files, and bring them to me...	Ð½Ð°Ð¹Ð´Ð¸ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÑ Ð¸ Ð¿ÑÐ¸Ð½ÐµÑÐ¸ Ð¸Ñ Ð¼Ð½Ðµâ¦	Ð·Ð½Ð°Ð¹Ð´Ð¸ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¸ Ð¹ Ð¿ÑÐ¸Ð½ÐµÑÐ¸ ÑÑ Ð¼ÐµÐ½Ñâ¦
-          \name[Shotgun]Yes sir...	\name[Shotgun]Yes sir...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢Ð°Ðº ÑÐ¾ÑÐ½Ð¾â¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢Ð°Ðº ÑÐ¾ÑÐ½Ð¾â¦
-          \name[Boss]This should be an easy mission so 	\name[Boss]This should be an easy mission so 	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐ°Ð´Ð°Ð½Ð¸Ðµ Ð¿ÑÐ¾ÑÑÐ¾Ðµ. ÐÐ¾Ð·ÑÐ¼Ð¸ Ñ ÑÐ¾Ð±Ð¾Ð¹	\name[ÐÐ¾Ð¼Ð°Ð½Ð´Ð¸Ñ]ÐÐ°Ð²Ð´Ð°Ð½Ð½Ñ Ð¿ÑÐ¾ÑÑÐµ. ÐÑÐ·ÑÐ¼Ð¸ ÑÐ· ÑÐ¾Ð±Ð¾Ñ
-          only take a flashlight,	only take a flashlight,	ÑÐ¾Ð»ÑÐºÐ¾ ÑÐ¾Ð½Ð°ÑÐ¸Ðº.	Ð»Ð¸ÑÐµ Ð»ÑÑÑÐ°ÑÐ¸Ðº.
-          \name[Shotgun]On it.	\name[Shotgun]On it.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÐ¿Ð¾Ð»Ð½ÑÑ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¸ÐºÐ¾Ð½ÑÑ.
-                                       30 minutes later...	                             30 minutes later...	30 Ð¼Ð¸Ð½ÑÑ ÑÐ¿ÑÑÑÑâ¦	30 ÑÐ²Ð¸Ð»Ð¸Ð½ Ð¿Ð¾ÑÐ¾Ð¼Ñâ¦
-                                              1:30 AM	                                    1:30 AM	01:30	01:30
-          \name[Shotgun]A chest with a combination lock. I 	\name[Shotgun]A chest with a combination lock. I 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ÑÐ¸Ðº Ñ ÐºÐ¾Ð´Ð¾Ð²ÑÐ¼ Ð·Ð°Ð¼ÐºÐ¾Ð¼. ÐÐ¾Ð´	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ÑÐ¸Ðº ÑÐ· ÐºÐ¾Ð´Ð¾Ð²Ð¸Ð¼ Ð·Ð°Ð¼ÐºÐ¾Ð¼. ÐÐ¾Ð´
-          don't know the code but three things come to mind...	don't know the code but three things come to mind...	Ð½Ðµ Ð·Ð½Ð°Ñ, Ð½Ð¾ ÐµÑÑÑ ÑÑÐ¸ Ð²Ð°ÑÐ¸Ð°Ð½ÑÐ°â¦	Ð½Ðµ Ð·Ð½Ð°Ñ, Ð°Ð»Ðµ Ñ ÑÑÐ¸ Ð²Ð°ÑÑÐ°Ð½ÑÐ¸â¦
-          \name[Shotgun]What should i type in?	\name[Shotgun]What should i type in?	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð§ÑÐ¾ Ð¿Ð¾Ð¿ÑÐ¾Ð±Ð¾Ð²Ð°ÑÑ Ð²Ð²ÐµÑÑÐ¸?	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð©Ð¾ ÑÐ¿ÑÐ¾Ð±ÑÐ²Ð°ÑÐ¸ Ð²Ð²ÐµÑÑÐ¸?
-          Don't type anything	Don't type anything	ÐÐ¸ÑÐµÐ³Ð¾ Ð½Ðµ Ð²Ð²Ð¾Ð´Ð¸ÑÑ	ÐÑÑÐ¾Ð³Ð¾ Ð½Ðµ Ð²Ð²Ð¾Ð´Ð¸ÑÐ¸
-          April 22	April 22	22 Ð°Ð¿ÑÐµÐ»Ñ	22 ÐºÐ²ÑÑÐ½Ñ
-          19281	19281	19281	19281
-          \name[Shotgun]I'll leave it...	\name[Shotgun]I'll leave it...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑÑÐ°Ð²Ð»Ñ ÐºÐ°Ðº ÐµÑÑÑâ¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°Ð»Ð¸ÑÑ ÑÐº Ñâ¦
-          \name[Shotgun]HECK! WHAT'S THE PASSWORD?!	\name[Shotgun]HECK! WHAT'S THE PASSWORD?!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð§ÐÐ Ð¢! ÐÐÐÐÐ ÐÐ ÐÐÐ ÐÐÐ¬?!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐÐÐ¬ÐÐ! Ð¯ÐÐÐ ÐÐ ÐÐÐ ÐÐÐ¬?!
-          \name[Shotgun]Incorrect.	\name[Shotgun]Incorrect.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐµÐ²ÐµÑÐ½Ð¾.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐµÐ¿ÑÐ°Ð²Ð¸Ð»ÑÐ½Ð¾.
-          \name[Shotgun]Got it.	\name[Shotgun]Got it.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð»ÑÑÐ¸Ð»Ð¾ÑÑ.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¸Ð¹ÑÐ»Ð¾.
-          \name[Shotgun]Wait a minute...	\name[Shotgun]Wait a minute...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¸Ð½ÑÑÐ¾ÑÐºÑâ¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¥Ð²Ð¸Ð»Ð¸Ð½ÐºÑâ¦
-          \name[Shotgun]WHAT?!	\name[Shotgun]WHAT?!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð§Ð¢Ð?!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð©Ð?!
-          \name[Shotgun]This is a photo of my idol Po The 	\name[Shotgun]This is a photo of my idol Po The 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð­ÑÐ¾ ÑÐ¾ÑÐ¾Ð³ÑÐ°ÑÐ¸Ñ Ð¼Ð¾ÐµÐ³Ð¾ ÐºÑÐ¼Ð¸ÑÐ°,	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¦Ðµ ÑÐ¾ÑÐ¾Ð³ÑÐ°ÑÑÑ Ð¼Ð¾Ð³Ð¾ ÐºÑÐ¼Ð¸ÑÐ°,
-          Medic!!!	Medic!!!	Ð¼ÐµÐ´Ð¸ÐºÐ° ÐÐ¾!!!	Ð¼ÐµÐ´Ð¸ÐºÐ¸Ð½Ñ ÐÐ¾!!!
-          \name[Shotgun]Oh my god! She's my favorite content 	\name[Shotgun]Oh my god! She's my favorite content 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð¶Ðµ! ÐÐ½Ð° Ð¼Ð¾Ð¹ Ð»ÑÐ±Ð¸Ð¼ÑÐ¹ Ð°Ð²ÑÐ¾Ñ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð¶Ðµ! ÐÐ¾Ð½Ð° Ð¼Ð¾Ñ ÑÐ»ÑÐ±Ð»ÐµÐ½Ð° Ð°Ð²ÑÐ¾ÑÐºÐ°
-          creator!!!	creator!!!	ÐºÐ¾Ð½ÑÐµÐ½ÑÐ°!!!	ÐºÐ¾Ð½ÑÐµÐ½ÑÑ!!!
-          \name[Shotgun]Her art is very cute! :)	\name[Shotgun]Her art is very cute! :)	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ½Ð° ÑÐ°Ðº Ð¼Ð¸Ð»Ð¾ ÑÐ¸ÑÑÐµÑ! :)	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð½Ð° ÑÐ°Ðº Ð¼Ð¸Ð»Ð¾ Ð¼Ð°Ð»ÑÑ! :)
-          \name[Shotgun]I am definitely taking this with me!	\name[Shotgun]I am definitely taking this with me!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð­ÑÐ¾ Ñ ÑÐ¾ÑÐ½Ð¾ Ð·Ð°Ð±ÐµÑÑ Ñ ÑÐ¾Ð±Ð¾Ð¹!	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¦Ðµ Ñ ÑÐ¾ÑÐ½Ð¾ Ð·Ð°Ð±ÐµÑÑ ÑÐ· ÑÐ¾Ð±Ð¾Ñ!
-          Obtained Framed Photo of Po The Medic	Obtained Framed Photo of Po The Medic	ÐÐ¾Ð»ÑÑÐµÐ½Ð¾ ÑÐ¾ÑÐ¾ Ð¼ÐµÐ´Ð¸ÐºÐ° ÐÐ¾ Ð² ÑÐ°Ð¼ÐºÐµ.	ÐÑÑÐ¸Ð¼Ð°Ð½Ð¾ ÑÐ¾ÑÐ¾ Ð¼ÐµÐ´Ð¸ÐºÐ¸Ð½Ñ ÐÐ¾ Ð² ÑÐ°Ð¼ÑÑ.
-          \name[Shotgun]If only i could meet her someday...	\name[Shotgun]If only i could meet her someday...	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ñ Ð±Ñ ÐºÐ¾Ð³Ð´Ð°-Ð½Ð¸Ð±ÑÐ´Ñ ÐµÑ Ð²ÑÑÑÐµÑÐ¸ÑÑâ¦	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑ Ð±Ð¸ ÐºÐ¾Ð»Ð¸ÑÑ ÑÑ Ð·ÑÑÑÑÑÑÐ¸â¦
-          \name[Shotgun]Maybe she's can fix my mental 	\name[Shotgun]Maybe she's can fix my mental 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð¶ÐµÑ, Ð¾Ð½Ð° Ð±Ñ Ð¿Ð¾Ð¼Ð¾Ð³Ð»Ð° Ð¼Ð½Ðµ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¾Ð¶Ðµ, Ð²Ð¾Ð½Ð° Ð± Ð´Ð¾Ð¿Ð¾Ð¼Ð¾Ð³Ð»Ð° Ð¼ÐµÐ½Ñ
-          health...	health...	ÑÐ¿ÑÐ°Ð²Ð¸ÑÑÑÑ Ñ Ð¼Ð¾Ð¸Ð¼Ð¸ Ð¿ÑÐ¾Ð±Ð»ÐµÐ¼Ð°Ð¼Ð¸â¦	ÑÐ¿Ð¾ÑÐ°ÑÐ¸ÑÑ Ð· Ð¼Ð¾ÑÐ¼Ð¸ Ð¿ÑÐ¾Ð±Ð»ÐµÐ¼Ð°Ð¼Ð¸â¦
-          \name[Shotgun]I already checked it	\name[Shotgun]I already checked it	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ ÑÐ¶Ðµ Ð·Ð°Ð³Ð»ÑÐ´ÑÐ²Ð°Ð» ÑÑÐ´Ð°.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ Ð²Ð¶Ðµ Ð·Ð°Ð·Ð¸ÑÐ°Ð² ÑÑÐ´Ð¸.
-          \name[Shotgun]Okay we're in. God this place is more 	\name[Shotgun]Okay we're in. God this place is more 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÑ Ð²Ð½ÑÑÑÐ¸. Ð¢ÑÑ Ð²ÑÑ ÐµÑÑ ÑÑÐ¶Ðµ, ÑÐµÐ¼	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ¸ Ð²ÑÐµÑÐµÐ´Ð¸Ð½Ñ. Ð¢ÑÑ ÑÑÐµ ÑÐµ Ð³ÑÑÑÐµ, Ð½ÑÐ¶
-          destroyed than i thought. I gotta be careful...	destroyed than i thought. I gotta be careful...	Ñ Ð´ÑÐ¼Ð°Ð». ÐÐ°Ð´Ð¾ Ð±ÑÑÑ Ð¾ÑÑÐ¾ÑÐ¾Ð¶Ð½ÐµÐµâ¦	Ñ Ð´ÑÐ¼Ð°Ð². Ð¢ÑÐµÐ±Ð° Ð±ÑÑÐ¸ Ð¾Ð±ÐµÑÐµÐ¶Ð½ÑÑÐ¸Ð¼â¦
-          \name[Shotgun]Let's get to the main area of the 	\name[Shotgun]Let's get to the main area of the 	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]ÐÐ°Ð´Ð¾ Ð¿Ð¾Ð¿Ð°ÑÑÑ Ð² Ð¾ÑÐ½Ð¾Ð²Ð½ÑÑ ÑÐ°ÑÑÑ	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¢ÑÐµÐ±Ð° Ð¿Ð¾ÑÑÐ°Ð¿Ð¸ÑÐ¸ Ð² Ð¾ÑÐ½Ð¾Ð²Ð½Ñ ÑÐ°ÑÑÐ¸Ð½Ñ
-          facility. I will start looking for the files there first...	facility. I will start looking for the files there first...	Ð¾Ð±ÑÐµÐºÑÐ°. Ð¢Ð°Ð¼ Ð¸ Ð½Ð°ÑÐ½Ñ Ð¿Ð¾Ð¸ÑÐº Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¾Ð²â¦	Ð¾Ð±'ÑÐºÑÐ°. Ð¢Ð°Ð¼ Ñ ÑÑÐºÐ°ÑÐ¸Ð¼Ñ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¸â¦
-          \name[Shotgun]I can't leave yet.	\name[Shotgun]I can't leave yet.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ Ð¿Ð¾ÐºÐ° Ð½Ðµ Ð¼Ð¾Ð³Ñ ÑÐ¹ÑÐ¸.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¯ Ð¿Ð¾ÐºÐ¸ Ð½Ðµ Ð¼Ð¾Ð¶Ñ Ð¿ÑÑÐ¸.
-          \name[Shotgun]I should search the main area first.	\name[Shotgun]I should search the main area first.	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡Ð½Ð°ÑÐ°Ð»Ð° Ð½Ð°Ð´Ð¾ Ð¾ÑÐ¼Ð¾ÑÑÐµÑÑ Ð¾ÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ Ð·Ð°Ð».	\name[Ð¨Ð¾ÑÐ³Ð°Ð½]Ð¡Ð¿Ð¾ÑÐ°ÑÐºÑ ÑÑÐµÐ±Ð° Ð¾Ð³Ð»ÑÐ½ÑÑÐ¸ Ð¾ÑÐ½Ð¾Ð²Ð½Ñ Ð·Ð°Ð»Ñ.
-          New Game	New Game	ÐÐ¾Ð²Ð°Ñ Ð¸Ð³ÑÐ°	ÐÐ¾Ð²Ð° Ð³ÑÐ°
-          Continue	Continue	ÐÑÐ¾Ð´Ð¾Ð»Ð¶Ð¸ÑÑ	ÐÑÐ¾Ð´Ð¾Ð²Ð¶Ð¸ÑÐ¸
-          Quit Game	Quit Game	ÐÑÑÐ¾Ð´	ÐÐ¸Ð¹ÑÐ¸
-          Press	Press	ÐÐ°Ð¶Ð¼Ð¸	ÐÐ°ÑÐ¸ÑÐ½Ð¸
-          SPACE to Start	OK to Start	OK Ð´Ð»Ñ ÑÑÐ°ÑÑÐ°	OK Ð´Ð»Ñ Ð¿Ð¾ÑÐ°ÑÐºÑ
-          Save Game	Save Game	Ð¡Ð¾ÑÑÐ°Ð½Ð¸ÑÑ	ÐÐ±ÐµÑÐµÐ³ÑÐ¸
-          End Game	End Game	ÐÐ°Ð²ÐµÑÑÐ¸ÑÑ	ÐÐ°Ð²ÐµÑÑÐ¸ÑÐ¸
-          To Title	To Title	Ð Ð³Ð»Ð°Ð²Ð½Ð¾Ðµ Ð¼ÐµÐ½Ñ	ÐÐ¾ Ð³Ð¾Ð»Ð¾Ð²Ð½Ð¾Ð³Ð¾ Ð¼ÐµÐ½Ñ
-          Cancel	Cancel	ÐÑÐ¼ÐµÐ½Ð°	Ð¡ÐºÐ°ÑÑÐ²Ð°ÑÐ¸
-          Play Time	Play Time	ÐÑÐµÐ¼Ñ Ð¸Ð³ÑÑ	Ð§Ð°Ñ Ð³ÑÐ¸
-          Step Count	Step Count	Ð¨Ð°Ð³Ð¸	ÐÑÐ¾ÐºÐ¸
-          Location	Location	ÐÐ¾ÐºÐ°ÑÐ¸Ñ	ÐÑÑÑÐµ
-          Location:	Location:	ÐÐ¾ÐºÐ°ÑÐ¸Ñ:	ÐÑÑÑÐµ:
-          Objective:	Objective:	ÐÐ°Ð´Ð°Ð½Ð¸Ðµ:	ÐÐ°Ð²Ð´Ð°Ð½Ð½Ñ:
-          File	File	Ð¡Ð»Ð¾Ñ	Ð¡Ð»Ð¾Ñ
-          Which file would you like to save to?	Which file would you like to save to?	Ð ÐºÐ°ÐºÐ¾Ð¹ ÑÐ»Ð¾Ñ ÑÐ¾ÑÑÐ°Ð½Ð¸ÑÑ Ð¸Ð³ÑÑ?	Ð£ ÑÐºÐ¸Ð¹ ÑÐ»Ð¾Ñ Ð·Ð±ÐµÑÐµÐ³ÑÐ¸ Ð³ÑÑ?
-          Which file would you like to load?	Which file would you like to load?	ÐÐ· ÐºÐ°ÐºÐ¾Ð³Ð¾ ÑÐ»Ð¾ÑÐ° Ð·Ð°Ð³ÑÑÐ·Ð¸ÑÑ Ð¸Ð³ÑÑ?	Ð ÑÐºÐ¾Ð³Ð¾ ÑÐ»Ð¾ÑÐ° Ð·Ð°Ð²Ð°Ð½ÑÐ°Ð¶Ð¸ÑÐ¸ Ð³ÑÑ?
-          number in possession	number in possession	ÐÐ¾Ð»Ð¸ÑÐµÑÑÐ²Ð¾	ÐÑÐ»ÑÐºÑÑÑÑ
-          Backpack	Backpack	Ð ÑÐºÐ·Ð°Ðº	Ð ÑÐºÐ·Ð°Ðº
-          Unknown Area	Unknown Area	ÐÐµÐ¸Ð·Ð²ÐµÑÑÐ½Ð°Ñ Ð·Ð¾Ð½Ð°	ÐÐµÐ²ÑÐ´Ð¾Ð¼Ð° Ð·Ð¾Ð½Ð°
-          Prologue	Prologue	ÐÑÐ¾Ð»Ð¾Ð³	ÐÑÐ¾Ð»Ð¾Ð³
-          Warning screen	Warning screen	ÐÑÐµÐ´ÑÐ¿ÑÐµÐ¶Ð´ÐµÐ½Ð¸Ðµ	ÐÐ¾Ð¿ÐµÑÐµÐ´Ð¶ÐµÐ½Ð½Ñ
-          Facility - 1st Floor	Facility - 1st Floor	ÐÐ±ÑÐµÐºÑ â 1-Ð¹ ÑÑÐ°Ð¶	ÐÐ±'ÑÐºÑ â 1-Ð¹ Ð¿Ð¾Ð²ÐµÑÑ
-          Facility - 1st Floor [RUN!]	Facility - 1st Floor [RUN!]	ÐÐ±ÑÐµÐºÑ â 1-Ð¹ ÑÑÐ°Ð¶ [ÐÐÐÐ!]	ÐÐ±'ÑÐºÑ â 1-Ð¹ Ð¿Ð¾Ð²ÐµÑÑ [ÐÐÐÐ!]
-          Outside	Outside	Ð¡Ð½Ð°ÑÑÐ¶Ð¸	ÐÐ°Ð´Ð²Ð¾ÑÑ
-          End of Prologue	End of Prologue	ÐÐ¾Ð½ÐµÑ Ð¿ÑÐ¾Ð»Ð¾Ð³Ð°	ÐÑÐ½ÐµÑÑ Ð¿ÑÐ¾Ð»Ð¾Ð³Ñ
-          Prologue Intro	Prologue Intro	ÐÐ°ÑÐ°Ð»Ð¾ Ð¿ÑÐ¾Ð»Ð¾Ð³Ð°	ÐÐ¾ÑÐ°ÑÐ¾Ðº Ð¿ÑÐ¾Ð»Ð¾Ð³Ñ
-          Facility Entrance	Facility Entrance	ÐÑÐ¾Ð´ Ð½Ð° Ð¾Ð±ÑÐµÐºÑ	ÐÑÑÐ´ Ð½Ð° Ð¾Ð±'ÑÐºÑ
-          Chapter 1	Chapter 1	ÐÐ»Ð°Ð²Ð° 1	Ð Ð¾Ð·Ð´ÑÐ» 1
-          Chapter 2	Chapter 2	ÐÐ»Ð°Ð²Ð° 2	Ð Ð¾Ð·Ð´ÑÐ» 2
-          Chapter 3	Chapter 3	ÐÐ»Ð°Ð²Ð° 3	Ð Ð¾Ð·Ð´ÑÐ» 3
-          Chapter 4	Chapter 4	ÐÐ»Ð°Ð²Ð° 4	Ð Ð¾Ð·Ð´ÑÐ» 4
-          Chapter 5	Chapter 5	ÐÐ»Ð°Ð²Ð° 5	Ð Ð¾Ð·Ð´ÑÐ» 5
-          Find the entrance	Find the entrance	ÐÐ°Ð¹ÑÐ¸ Ð²ÑÐ¾Ð´	ÐÐ½Ð°Ð¹ÑÐ¸ Ð²ÑÑÐ´
-          Find the files	Find the files	ÐÐ°Ð¹ÑÐ¸ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÑ	ÐÐ½Ð°Ð¹ÑÐ¸ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¸
-          Head inside the Facility	Head inside the Facility	ÐÐ¾Ð¹ÑÐ¸ Ð½Ð° Ð¾Ð±ÑÐµÐºÑ	Ð£Ð²ÑÐ¹ÑÐ¸ Ð½Ð° Ð¾Ð±'ÑÐºÑ
-          Head to the main area of the facility	Head to the main area of the facility	ÐÑÐ¾Ð¹ÑÐ¸ Ð² Ð¾ÑÐ½Ð¾Ð²Ð½ÑÑ ÑÐ°ÑÑÑ Ð¾Ð±ÑÐµÐºÑÐ°	ÐÑÐ¾Ð¹ÑÐ¸ Ð² Ð¾ÑÐ½Ð¾Ð²Ð½Ñ ÑÐ°ÑÑÐ¸Ð½Ñ Ð¾Ð±'ÑÐºÑÐ°
-          Look around for a key	Look around for a key	ÐÐ¾Ð¸ÑÐºÐ°ÑÑ ÐºÐ»ÑÑ Ð¿Ð¾Ð±Ð»Ð¸Ð·Ð¾ÑÑÐ¸	ÐÐ¾ÑÑÐºÐ°ÑÐ¸ ÐºÐ»ÑÑ Ð¿Ð¾Ð±Ð»Ð¸Ð·Ñ
-          Open the Security Room	Open the Security Room	ÐÑÐºÑÑÑÑ ÐºÐ¾Ð¼Ð½Ð°ÑÑ Ð¾ÑÑÐ°Ð½Ñ	ÐÑÐ´ÑÐ¸Ð½Ð¸ÑÐ¸ ÐºÑÐ¼Ð½Ð°ÑÑ Ð¾ÑÐ¾ÑÐ¾Ð½Ð¸
-          RUN!	RUN!	ÐÐÐÐ!	ÐÐÐÐ!
-          Search the Storage Room	Search the Storage Room	ÐÐ±ÑÑÐºÐ°ÑÑ ÐºÐ»Ð°Ð´Ð¾Ð²ÑÑ	ÐÐ±ÑÑÐºÐ°ÑÐ¸ ÐºÐ¾Ð¼Ð¾ÑÑ
-          Search the storage room	Search the storage room	ÐÐ±ÑÑÐºÐ°ÑÑ ÐºÐ»Ð°Ð´Ð¾Ð²ÑÑ	ÐÐ±ÑÑÐºÐ°ÑÐ¸ ÐºÐ¾Ð¼Ð¾ÑÑ
-          Search the area for the files	Search the area for the files	ÐÐ±ÑÑÐºÐ°ÑÑ Ð¿Ð¾Ð¼ÐµÑÐµÐ½Ð¸Ðµ Ð¸ Ð½Ð°Ð¹ÑÐ¸ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÑ	ÐÐ±ÑÑÐºÐ°ÑÐ¸ Ð¿ÑÐ¸Ð¼ÑÑÐµÐ½Ð½Ñ Ð¹ Ð·Ð½Ð°Ð¹ÑÐ¸ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¸
-          look for the security room key in the storage room	look for the security room key in the storage room	ÐÐ¾Ð¸ÑÐºÐ°ÑÑ Ð² ÐºÐ»Ð°Ð´Ð¾Ð²Ð¾Ð¹ ÐºÐ»ÑÑ Ð¾Ñ ÐºÐ¾Ð¼Ð½Ð°ÑÑ Ð¾ÑÑÐ°Ð½Ñ	ÐÐ¾ÑÑÐºÐ°ÑÐ¸ Ð² ÐºÐ¾Ð¼Ð¾ÑÑ ÐºÐ»ÑÑ Ð²ÑÐ´ ÐºÑÐ¼Ð½Ð°ÑÐ¸ Ð¾ÑÐ¾ÑÐ¾Ð½Ð¸
-          Main Door Key	Main Door Key	ÐÐ»ÑÑ Ð¾Ñ Ð³Ð»Ð°Ð²Ð½Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ð°	ÐÐ»ÑÑ Ð²ÑÐ´ Ð³Ð¾Ð»Ð¾Ð²Ð½Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ñ
-          A old brass key, can be used to unlock the front door to the faciltiy.	A old brass key, can be used to unlock the front door to the faciltiy.	Ð¡ÑÐ°ÑÑÐ¹ Ð»Ð°ÑÑÐ½Ð½ÑÐ¹ ÐºÐ»ÑÑ Ð¾Ñ Ð³Ð»Ð°Ð²Ð½Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ð° Ð½Ð° Ð¾Ð±ÑÐµÐºÑ.	Ð¡ÑÐ°ÑÐ¸Ð¹ Ð»Ð°ÑÑÐ½Ð½Ð¸Ð¹ ÐºÐ»ÑÑ Ð²ÑÐ´ Ð³Ð¾Ð»Ð¾Ð²Ð½Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ñ Ð½Ð° Ð¾Ð±'ÑÐºÑ.
-          Storage Room Key	Storage Room Key	ÐÐ»ÑÑ Ð¾Ñ ÐºÐ»Ð°Ð´Ð¾Ð²Ð¾Ð¹	ÐÐ»ÑÑ Ð²ÑÐ´ ÐºÐ¾Ð¼Ð¾ÑÐ¸
-          A modern red key, can be used to unlock the storage room.	A modern red key, can be used to unlock the storage room.	Ð¡Ð¾Ð²ÑÐµÐ¼ÐµÐ½Ð½ÑÐ¹ ÐºÑÐ°ÑÐ½ÑÐ¹ ÐºÐ»ÑÑ Ð¾Ñ ÐºÐ»Ð°Ð´Ð¾Ð²Ð¾Ð¹.	Ð¡ÑÑÐ°ÑÐ½Ð¸Ð¹ ÑÐµÑÐ²Ð¾Ð½Ð¸Ð¹ ÐºÐ»ÑÑ Ð²ÑÐ´ ÐºÐ¾Ð¼Ð¾ÑÐ¸.
-          Security Room Key	Security Room Key	ÐÐ»ÑÑ Ð¾Ñ ÐºÐ¾Ð¼Ð½Ð°ÑÑ Ð¾ÑÑÐ°Ð½Ñ	ÐÐ»ÑÑ Ð²ÑÐ´ ÐºÑÐ¼Ð½Ð°ÑÐ¸ Ð¾ÑÐ¾ÑÐ¾Ð½Ð¸
-          A black modern key. can be used to unlock the security room.	A black modern key. can be used to unlock the security room.	Ð¡Ð¾Ð²ÑÐµÐ¼ÐµÐ½Ð½ÑÐ¹ ÑÑÑÐ½ÑÐ¹ ÐºÐ»ÑÑ Ð¾Ñ ÐºÐ¾Ð¼Ð½Ð°ÑÑ Ð¾ÑÑÐ°Ð½Ñ.	Ð¡ÑÑÐ°ÑÐ½Ð¸Ð¹ ÑÐ¾ÑÐ½Ð¸Ð¹ ÐºÐ»ÑÑ Ð²ÑÐ´ ÐºÑÐ¼Ð½Ð°ÑÐ¸ Ð¾ÑÐ¾ÑÐ¾Ð½Ð¸.
-          Top Secret Files	Top Secret Files	Ð¡ÐµÐºÑÐµÑÐ½ÑÐµ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÑ	Ð¢Ð°ÑÐ¼Ð½Ñ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¸
-          (MISSION ITEM) A folder of top secret files that the boss ordered Shotgun to retrieve.	(MISSION ITEM) A folder of top secret files that the boss ordered Shotgun to retrieve.	(ÐÐÐÐÐÐÐ) ÐÐ°Ð¿ÐºÐ° ÑÐµÐºÑÐµÑÐ½ÑÑ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÐ¾Ð², ÐºÐ¾ÑÐ¾ÑÑÑ Ð¨Ð¾ÑÐ³Ð°Ð½Ñ Ð¿Ð¾ÑÑÑÐ¸Ð»Ð¸ Ð¿ÑÐ¸Ð½ÐµÑÑÐ¸.	(ÐÐÐÐÐÐÐÐ¯) Ð¢ÐµÐºÐ° ÑÐ°ÑÐ¼Ð½Ð¸Ñ Ð´Ð¾ÐºÑÐ¼ÐµÐ½ÑÑÐ², ÑÐºÑ Ð¨Ð¾ÑÐ³Ð°Ð½Ñ Ð´Ð¾ÑÑÑÐ¸Ð»Ð¸ Ð¿ÑÐ¸Ð½ÐµÑÑÐ¸.
-          Secret Photograph	Secret Photograph	Ð¢Ð°Ð¹Ð½Ð°Ñ ÑÐ¾ÑÐ¾Ð³ÑÐ°ÑÐ¸Ñ	Ð¢Ð°ÑÐ¼Ð½Ð° ÑÐ¾ÑÐ¾Ð³ÑÐ°ÑÑÑ
-          (COLLECTIBLE ITEM) An old photograph of Kolach Xonal from Black Sector. Good game!	(COLLECTIBLE ITEM) An old photograph of Kolach Xonal from Black Sector. Good game!	(ÐÐÐÐÐÐÐ¦ÐÐ¯) Ð¡ÑÐ°ÑÐ°Ñ ÑÐ¾ÑÐ¾Ð³ÑÐ°ÑÐ¸Ñ ÐÐ¾Ð»Ð°ÑÐ° ÐÑÐ¾Ð½Ð°Ð»Ð° Ð¸Ð· Black Sector. Ð¥Ð¾ÑÐ¾ÑÐ°Ñ Ð¸Ð³ÑÐ°!	(ÐÐÐÐÐÐ¦ÐÐ¯) Ð¡ÑÐ°ÑÐ° ÑÐ¾ÑÐ¾Ð³ÑÐ°ÑÑÑ ÐÐ¾Ð»Ð°ÑÐ° ÐÑÐ¾Ð½Ð°Ð»Ð° Ð· Black Sector. ÐÐ°ÑÐ½Ð° Ð³ÑÐ°!
-          Framed Photo of Po The Medic	Framed Photo of Po The Medic	Ð¤Ð¾ÑÐ¾ Ð¼ÐµÐ´Ð¸ÐºÐ° ÐÐ¾ Ð² ÑÐ°Ð¼ÐºÐµ	Ð¤Ð¾ÑÐ¾ Ð¼ÐµÐ´Ð¸ÐºÐ¸Ð½Ñ ÐÐ¾ Ð² ÑÐ°Ð¼ÑÑ
-          (COLLECTIBLE) An Framed photo of Shotgun's favorite content creator! W MEDIC!!!	(COLLECTIBLE) An Framed photo of Shotgun's favorite content creator! W MEDIC!!!	(ÐÐÐÐÐÐÐ¦ÐÐ¯) Ð¤Ð¾ÑÐ¾ Ð»ÑÐ±Ð¸Ð¼Ð¾Ð³Ð¾ Ð°Ð²ÑÐ¾ÑÐ° Ð¨Ð¾ÑÐ³Ð°Ð½Ð° Ð² ÑÐ°Ð¼ÐºÐµ. ÐÐ¾, ÑÑ Ð»ÑÑÑÐ°Ñ!	(ÐÐÐÐÐÐ¦ÐÐ¯) Ð¤Ð¾ÑÐ¾ ÑÐ»ÑÐ±Ð»ÐµÐ½Ð¾Ñ Ð°Ð²ÑÐ¾ÑÐºÐ¸ Ð¨Ð¾ÑÐ³Ð°Ð½Ð° Ð² ÑÐ°Ð¼ÑÑ. ÐÐ¾, ÑÐ¸ Ð½Ð°Ð¹ÐºÑÐ°ÑÐ°!
-          Collectible found!	Collectible found!	ÐÐ°Ð¹Ð´ÐµÐ½ Ð¿ÑÐµÐ´Ð¼ÐµÑ ÐºÐ¾Ð»Ð»ÐµÐºÑÐ¸Ð¸!	ÐÐ½Ð°Ð¹Ð´ÐµÐ½Ð¾ Ð¿ÑÐµÐ´Ð¼ÐµÑ ÐºÐ¾Ð»ÐµÐºÑÑÑ!
-          Tip: If you ever get stuck, check the Pause Menu to view your objective.	Tip: If you ever get stuck, check the Pause Menu to view your objective.	Ð¡Ð¾Ð²ÐµÑ. ÐÑÐ»Ð¸ Ð·Ð°ÑÑÑÑÐ», Ð¿Ð¾ÑÐ¼Ð¾ÑÑÐ¸ ÑÐµÐºÑÑÐµÐµ Ð·Ð°Ð´Ð°Ð½Ð¸Ðµ Ð² Ð¼ÐµÐ½Ñ Ð¿Ð°ÑÐ·Ñ.	ÐÐ¾ÑÐ°Ð´Ð°. Ð¯ÐºÑÐ¾ Ð·Ð°ÑÑÑÑÐ³, Ð¿ÐµÑÐµÐ³Ð»ÑÐ½Ñ Ð¿Ð¾ÑÐ¾ÑÐ½Ðµ Ð·Ð°Ð²Ð´Ð°Ð½Ð½Ñ Ð² Ð¼ÐµÐ½Ñ Ð¿Ð°ÑÐ·Ð¸.
-          Tip: Never turn back during chases, your enemies may be smarter than you think.	Tip: Never turn back during chases, your enemies may be smarter than you think.	Ð¡Ð¾Ð²ÐµÑ. ÐÐ¾ Ð²ÑÐµÐ¼Ñ Ð¿Ð¾Ð³Ð¾Ð½Ð¸ Ð½Ðµ Ð¾Ð³Ð»ÑÐ´ÑÐ²Ð°Ð¹ÑÑ. ÐÑÐ°Ð³Ð¸ Ð¼Ð¾Ð³ÑÑ Ð±ÑÑÑ ÑÐ¼Ð½ÐµÐµ, ÑÐµÐ¼ ÐºÐ°Ð¶ÑÑÑÑ.	ÐÐ¾ÑÐ°Ð´Ð°. ÐÑÐ´ ÑÐ°Ñ Ð¿Ð¾Ð³Ð¾Ð½Ñ Ð½Ðµ Ð¾Ð·Ð¸ÑÐ°Ð¹ÑÑ. ÐÐ¾ÑÐ¾Ð³Ð¸ Ð¼Ð¾Ð¶ÑÑÑ Ð±ÑÑÐ¸ ÑÐ¾Ð·ÑÐ¼Ð½ÑÑÑ, Ð½ÑÐ¶ Ð·Ð´Ð°ÑÑÑÑÑ.
-          Tip: Items can be in plain sight, search everywhere.	Tip: Items can be in plain sight, search everywhere.	Ð¡Ð¾Ð²ÐµÑ. ÐÑÐµÐ´Ð¼ÐµÑÑ Ð±ÑÐ²Ð°ÑÑ Ð½Ð° Ð²Ð¸Ð´Ñ. ÐÑÐ¸ Ð²ÐµÐ·Ð´Ðµ.	ÐÐ¾ÑÐ°Ð´Ð°. ÐÑÐµÐ´Ð¼ÐµÑÐ¸ Ð±ÑÐ²Ð°ÑÑÑ Ð½Ð° Ð²Ð¸Ð´Ð½Ð¾ÑÑ. Ð¨ÑÐºÐ°Ð¹ ÑÑÑÐ´Ð¸.
-          Tip: Pay attention to dialogue or you might risk misunderstanding your task.	Tip: Pay attention to dialogue or you might risk misunderstanding your task.	Ð¡Ð¾Ð²ÐµÑ. Ð§Ð¸ÑÐ°Ð¹ Ð´Ð¸Ð°Ð»Ð¾Ð³Ð¸ Ð²Ð½Ð¸Ð¼Ð°ÑÐµÐ»ÑÐ½Ð¾, ÑÑÐ¾Ð±Ñ Ð¿Ð¾Ð½ÑÑÑ Ð·Ð°Ð´Ð°Ð½Ð¸Ðµ.	ÐÐ¾ÑÐ°Ð´Ð°. Ð§Ð¸ÑÐ°Ð¹ Ð´ÑÐ°Ð»Ð¾Ð³Ð¸ ÑÐ²Ð°Ð¶Ð½Ð¾, ÑÐ¾Ð± Ð·ÑÐ¾Ð·ÑÐ¼ÑÑÐ¸ Ð·Ð°Ð²Ð´Ð°Ð½Ð½Ñ.
-          "Your worse thoughts can become reality faster than you think."	"Your worse thoughts can become reality faster than you think."	Â«Ð¥ÑÐ´ÑÐ¸Ðµ Ð¼ÑÑÐ»Ð¸ Ð¼Ð¾Ð³ÑÑ ÑÐ±ÑÑÑÑÑ Ð±ÑÑÑÑÐµÐµ, ÑÐµÐ¼ ÐºÐ°Ð¶ÐµÑÑÑÂ».	Â«ÐÐ°Ð¹Ð³ÑÑÑÑ Ð´ÑÐ¼ÐºÐ¸ Ð¼Ð¾Ð¶ÑÑÑ Ð·Ð´ÑÐ¹ÑÐ½Ð¸ÑÐ¸ÑÑ ÑÐ²Ð¸Ð´ÑÐµ, Ð½ÑÐ¶ Ð·Ð´Ð°ÑÑÑÑÑÂ».
-          "W Taste Gaming!"	"W Taste Gaming!"	Â«Taste Gaming, ÑÑ Ð»ÑÑÑÐ¸Ð¹!Â»	Â«Taste Gaming, ÑÐ¸ Ð½Ð°Ð¹ÐºÑÐ°ÑÐ¸Ð¹!Â»
-          "Who are these strangers?"	"Who are these strangers?"	Â«ÐÑÐ¾ ÑÑÐ¸ Ð½ÐµÐ·Ð½Ð°ÐºÐ¾Ð¼ÑÑ?Â»	Â«Ð¥ÑÐ¾ ÑÑ Ð½ÐµÐ·Ð½Ð°Ð¹Ð¾Ð¼ÑÑ?Â»
-          "My neighbors. Where'd they go?"	"My neighbors. Where'd they go?"	Â«Ð¡Ð¾ÑÐµÐ´Ð¸â¦ ÐÑÐ´Ð° Ð¾Ð½Ð¸ Ð¿ÑÐ¾Ð¿Ð°Ð»Ð¸?Â»	Â«Ð¡ÑÑÑÐ´Ð¸â¦ ÐÑÐ´Ð¸ Ð²Ð¾Ð½Ð¸ Ð·Ð½Ð¸ÐºÐ»Ð¸?Â»
-          "Beware the C.O.A.T."	"Beware the C.O.A.T."	Â«ÐÐµÑÐµÐ³Ð¸ÑÑ C.O.A.T.Â»	Â«Ð¡ÑÐµÑÐµÐ¶Ð¸ÑÑ C.O.A.T.Â»
-          "Do people even read these???"	"Do people even read these???"	Â«Ð­ÑÐ¾ Ð²Ð¾Ð¾Ð±ÑÐµ ÐºÑÐ¾-Ð½Ð¸Ð±ÑÐ´Ñ ÑÐ¸ÑÐ°ÐµÑ???Â»	Â«Ð¦Ðµ Ð²Ð·Ð°Ð³Ð°Ð»Ñ ÑÑÐ¾ÑÑ ÑÐ¸ÑÐ°Ñ???Â»
-          "We all need a doctor.. But we got Po The Medic!"	"We all need a doctor.. But we got Po The Medic!"	Â«ÐÐ°Ð¼ Ð½ÑÐ¶ÐµÐ½ Ð´Ð¾ÐºÑÐ¾Ñâ¦ Ð Ñ Ð½Ð°Ñ ÐµÑÑÑ Ð¼ÐµÐ´Ð¸Ðº ÐÐ¾!Â»	Â«ÐÐ°Ð¼ Ð¿Ð¾ÑÑÑÐ±ÐµÐ½ Ð»ÑÐºÐ°Ñâ¦ Ð Ð² Ð½Ð°Ñ Ñ Ð¼ÐµÐ´Ð¸ÐºÐ¸Ð½Ñ ÐÐ¾!Â»
-          TUBBYLEGACY_LOCALE_TSV
-          cat > Host.m <<'TUBBYLEGACY_HOST_M'
-          #import <UIKit/UIKit.h>
-          #import "app_bridge.h"
-
-          @interface LegacyControls : UIView
-          @property(nonatomic, strong) NSMutableDictionary<NSNumber *, UIButton *> *buttons;
-          @end
-
-          @implementation LegacyControls
-          - (instancetype)initWithFrame:(CGRect)frame {
-              self = [super initWithFrame:frame];
-              if (!self) return nil;
-              self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-              self.multipleTouchEnabled = YES;
-              self.buttons = [NSMutableDictionary dictionary];
-              NSDictionary<NSNumber *, NSString *> *labels = @{
-                  @(MKXP_SCANCODE_UP): @"â", @(MKXP_SCANCODE_LEFT): @"â",
-                  @(MKXP_SCANCODE_DOWN): @"â", @(MKXP_SCANCODE_RIGHT): @"â",
-                  @(MKXP_SCANCODE_RETURN): @"OK", @(MKXP_SCANCODE_ESCAPE): @"BACK",
-                  @(MKXP_SCANCODE_Q): @"â", @(MKXP_SCANCODE_W): @"â¶"
-              };
-              [labels enumerateKeysAndObjectsUsingBlock:^(NSNumber *key, NSString *label, BOOL *stop) {
-                  UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-                  button.tag = key.integerValue;
-                  button.tintColor = UIColor.whiteColor;
-                  button.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.78];
-                  button.layer.cornerRadius = 12;
-                  button.layer.borderWidth = 1;
-                  button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.34].CGColor;
-                  button.accessibilityLabel = label;
-                  button.titleLabel.font = [UIFont systemFontOfSize:label.length > 2 ? 12 : 20 weight:UIFontWeightSemibold];
-                  [button setTitle:label forState:UIControlStateNormal];
-                  [button addTarget:self action:@selector(buttonDown:) forControlEvents:UIControlEventTouchDown | UIControlEventTouchDragEnter];
-                  [button addTarget:self action:@selector(buttonUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
-                  [self addSubview:button];
-                  self.buttons[key] = button;
-              }];
-              [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(releaseButtons:) name:UIApplicationWillResignActiveNotification object:nil];
-              return self;
-          }
-
-          - (void)buttonDown:(UIButton *)button {
-              mkxp_injectKeyEvent((int)button.tag, 1);
-          }
-
-          - (void)buttonUp:(UIButton *)button {
-              mkxp_injectKeyEvent((int)button.tag, 0);
-          }
-
-          - (void)releaseButtons:(NSNotification *)notification {
-              for (UIButton *button in self.buttons.allValues) [self buttonUp:button];
-          }
-
-          - (void)layoutSubviews {
-              [super layoutSubviews];
-              CGRect safe = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
-              CGFloat size = MIN(50, MAX(38, CGRectGetWidth(safe) * 0.066));
-              CGFloat stride = size + 7;
-              CGFloat x = CGRectGetMinX(safe) + 8;
-              CGFloat y = CGRectGetMaxY(safe) - size - 8;
-              CGFloat right = CGRectGetMaxX(safe) - size - 8;
-              self.buttons[@(MKXP_SCANCODE_UP)].frame = CGRectMake(x + stride, y - stride, size, size);
-              self.buttons[@(MKXP_SCANCODE_LEFT)].frame = CGRectMake(x, y, size, size);
-              self.buttons[@(MKXP_SCANCODE_DOWN)].frame = CGRectMake(x + stride, y, size, size);
-              self.buttons[@(MKXP_SCANCODE_RIGHT)].frame = CGRectMake(x + stride * 2, y, size, size);
-              self.buttons[@(MKXP_SCANCODE_RETURN)].frame = CGRectMake(right, y, size, size);
-              self.buttons[@(MKXP_SCANCODE_ESCAPE)].frame = CGRectMake(right - stride, y, size, size);
-              self.buttons[@(MKXP_SCANCODE_Q)].frame = CGRectMake(right - stride, y - stride, size, size);
-              self.buttons[@(MKXP_SCANCODE_W)].frame = CGRectMake(right, y - stride, size, size);
-          }
-
-          - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-              UIView *hit = [super hitTest:point withEvent:event];
-              return hit == self ? nil : hit;
-          }
-          @end
-
-          static UIWindow *startupWindow;
-          static BOOL gameStarted;
-
-          static void attachControls(float x, float y, float width, float height, void *context) {
-              dispatch_async(dispatch_get_main_queue(), ^{
-                  UIWindow *window = (__bridge UIWindow *)mkxp_getGameWindow();
-                  if (!window) return;
-                  static NSInteger controlsTag = 9213;
-                  if ([window viewWithTag:controlsTag]) return;
-                  LegacyControls *controls = [[LegacyControls alloc] initWithFrame:window.bounds];
-                  controls.tag = controlsTag;
-                  [window addSubview:controls];
-              });
-          }
-
-          static void showError(const char *message, void *context) {
-              NSString *text = message ? [NSString stringWithUTF8String:message] : @"";
-              dispatch_async(dispatch_get_main_queue(), ^{
-                  UIWindow *window = (__bridge UIWindow *)mkxp_getGameWindow();
-                  UIViewController *root = window.rootViewController ?: startupWindow.rootViewController;
-                  if (!root) {
-                      mkxp_signalErrorDismissed();
-                      return;
-                  }
-                  UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"TubbyLegacy"
-                      message:text preferredStyle:UIAlertControllerStyleAlert];
-                  [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault
-                      handler:^(__unused UIAlertAction *action) { mkxp_signalErrorDismissed(); }]];
-                  [root presentViewController:alert animated:YES completion:nil];
-              });
-          }
-
-          static void startGame(void) {
-              NSFileManager *files = NSFileManager.defaultManager;
-              NSString *resources = NSBundle.mainBundle.resourcePath;
-              NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-              NSString *game = [documents stringByAppendingPathComponent:@"TubbyLegacy-v010"];
-              if (![files fileExistsAtPath:game]) {
-                  NSString *source = [resources stringByAppendingPathComponent:@"Game"];
-                  NSString *staging = [documents stringByAppendingPathComponent:@"TubbyLegacy-import"];
-                  [files removeItemAtPath:staging error:nil];
-                  NSError *error = nil;
-                  if (![files copyItemAtPath:source toPath:staging error:&error] ||
-                      ![files moveItemAtPath:staging toPath:game error:&error]) {
-                      showError(error.localizedDescription.UTF8String, NULL);
-                      return;
-                  }
-              }
-              [UIApplication sharedApplication].idleTimerDisabled = YES;
-              mkxp_setLauncherIdentity("TubbyLegacy iOS", "0.1.0");
-              mkxp_setUserDataDirectory(documents.fileSystemRepresentation);
-              mkxp_setSharedFontsDirectory([resources stringByAppendingPathComponent:@"Assets.bundle/Fonts"].fileSystemRepresentation);
-              mkxp_setCABundlePath([resources stringByAppendingPathComponent:@"Assets.bundle/cacert.pem"].fileSystemRepresentation);
-              mkxp_setManagedConfigDir(game.fileSystemRepresentation);
-              mkxp_setActiveRubyVersion(MKXP_RUBY_31);
-              mkxp_setGameRectChangedCallback(attachControls, NULL);
-              mkxp_setErrorMessageCallback(showError, NULL);
-              mkxp_setGamePath(game.fileSystemRepresentation);
-              char *argv[] = { "TubbyLegacy", NULL };
-              mkxp_run_app(1, argv);
-              UIWindow *window = (__bridge UIWindow *)mkxp_getGameWindow();
-              [window setHidden:YES];
-              UIApplication.sharedApplication.idleTimerDisabled = NO;
-              [startupWindow makeKeyAndVisible];
-          }
-
-          @interface LegacySceneDelegate : UIResponder <UIWindowSceneDelegate>
-          @property(nonatomic, strong) UIWindow *window;
-          @end
-
-          @implementation LegacySceneDelegate
-          - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session
-                options:(UISceneConnectionOptions *)options {
-              if (![scene isKindOfClass:UIWindowScene.class]) return;
-              self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
-              self.window.rootViewController = [UIViewController new];
-              self.window.rootViewController.view.backgroundColor = UIColor.blackColor;
-              UILabel *name = [UILabel new];
-              name.text = @"TubbyLegacy";
-              name.textColor = UIColor.whiteColor;
-              name.font = [UIFont systemFontOfSize:24 weight:UIFontWeightSemibold];
-              name.translatesAutoresizingMaskIntoConstraints = NO;
-              [self.window.rootViewController.view addSubview:name];
-              [NSLayoutConstraint activateConstraints:@[
-                  [name.centerXAnchor constraintEqualToAnchor:self.window.rootViewController.view.centerXAnchor],
-                  [name.centerYAnchor constraintEqualToAnchor:self.window.rootViewController.view.centerYAnchor]
-              ]];
-              startupWindow = self.window;
-              [self.window makeKeyAndVisible];
-              if (!gameStarted) {
-                  gameStarted = YES;
-                  [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:NO block:^(__unused NSTimer *timer) { startGame(); }];
-              }
-          }
-          @end
-
-          @interface LegacyAppDelegate : UIResponder <UIApplicationDelegate>
-          @end
-          @implementation LegacyAppDelegate
-          @end
-
-          int main(int argc, char *argv[]) {
-              @autoreleasepool {
-                  return UIApplicationMain(argc, argv, nil, NSStringFromClass(LegacyAppDelegate.class));
-              }
-          }
-          TUBBYLEGACY_HOST_M
-          cat > Info.plist <<'TUBBYLEGACY_INFO_PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-          	<key>CFBundleDevelopmentRegion</key>
-          	<string>en</string>
-          	<key>CFBundleDisplayName</key>
-          	<string>TubbyLegacy</string>
-          	<key>CFBundleExecutable</key>
-          	<string>TubbyLegacy</string>
-          	<key>CFBundleIdentifier</key>
-          	<string>com.negelinho.tubbylegacy</string>
-          	<key>CFBundleInfoDictionaryVersion</key>
-          	<string>6.0</string>
-          	<key>CFBundleName</key>
-          	<string>TubbyLegacy</string>
-          	<key>CFBundlePackageType</key>
-          	<string>APPL</string>
-          	<key>CFBundleShortVersionString</key>
-          	<string>0.1.0</string>
-          	<key>CFBundleVersion</key>
-          	<string>1</string>
-          	<key>LSRequiresIPhoneOS</key>
-          	<true/>
-          	<key>MinimumOSVersion</key>
-          	<string>26.0</string>
-          	<key>UIApplicationSceneManifest</key>
-          	<dict>
-          		<key>UIApplicationSupportsMultipleScenes</key>
-          		<false/>
-          		<key>UISceneConfigurations</key>
-          		<dict>
-          			<key>UIWindowSceneSessionRoleApplication</key>
-          			<array>
-          				<dict>
-          					<key>UISceneConfigurationName</key>
-          					<string>Default Configuration</string>
-          					<key>UISceneDelegateClassName</key>
-          					<string>LegacySceneDelegate</string>
-          				</dict>
-          			</array>
-          		</dict>
-          	</dict>
-          	<key>UIDeviceFamily</key>
-          	<array>
-          		<integer>1</integer>
-          		<integer>2</integer>
-          	</array>
-          	<key>UILaunchScreen</key>
-          	<dict/>
-          	<key>UIRequiredDeviceCapabilities</key>
-          	<array>
-          		<string>arm64</string>
-          	</array>
-          	<key>UIRequiresFullScreen</key>
-          	<true/>
-          	<key>UIStatusBarHidden</key>
-          	<true/>
-          	<key>UISupportedInterfaceOrientations</key>
-          	<array>
-          		<string>UIInterfaceOrientationLandscapeLeft</string>
-          		<string>UIInterfaceOrientationLandscapeRight</string>
-          	</array>
-          	<key>UIViewControllerBasedStatusBarAppearance</key>
-          	<false/>
-          </dict>
-          </plist>
-          TUBBYLEGACY_INFO_PLIST
-          cat > build-ios.sh <<'TUBBYLEGACY_BUILD_IOS_SH'
-          #!/bin/bash
-          set -euo pipefail
-          port="$(cd "$(dirname "$0")" && pwd)"
-          work="${1:?Pass an absolute build directory}"
-          app="$work/Payload/TubbyLegacy.app"
-          engine="$work/engine"
-          angle="$work/angle"
-          mkdir -p "$app" "$engine" "$angle"
-
-          fetch() {
-              local url="$1" digest="$2" destination="$3"
-              curl -fLsS --retry 2 "$url" -o "$destination"
-              echo "$digest  $destination" | shasum -a 256 -c
-          }
-
-          fetch 'https://github.com/mateo-m/mkxp-z-apple-mobile/releases/download/v17/mkxp-z-ios.tar.gz' \
-              '6e6a77f36e8d7e58e658b5c12d15c9aae3722feb69d731b5a7f9463207ae9809' "$work/engine.tar.gz"
-          fetch 'https://github.com/mateo-m/empo-deps/releases/download/angle-2026-11-01/angle-apple-prebuilt.tar.gz' \
-              '22f6b332acaa9973650c30a99314287594fbf9ed38db682c2389bd34181e7831' "$work/angle.tar.gz"
-
-          tar -xzf "$work/engine.tar.gz" -C "$engine"
-          tar -xzf "$work/angle.tar.gz" -C "$angle"
-          python3 "$port/download_game.py" "$app/Game"
-          ruby "$port/patch_game.rb" "$app/Game" "$port"
-          cp "$port/Info.plist" "$app/Info.plist"
-          cp -R "$engine/assets" "$app/Assets.bundle"
-          cp -R "$engine/iphoneos/ruby-stdlib" "$app/Ruby"
-          cp "$engine/licenses.json" "$app/Assets.bundle/licenses.json"
-          printf '%s\n' 'mkxp-z-apple-mobile, Copyright (C) 2026 Mateo M., https://github.com/mateo-m/mkxp-z-apple-mobile' > "$app/Assets.bundle/ENGINE-CREDITS.txt"
-
-          flags=(-isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -target arm64-apple-ios26.0)
-          xcrun --sdk iphoneos clang "${flags[@]}" -fobjc-arc -O2 -I"$engine/include" \
-              -c "$port/Host.m" -o "$work/Host.o"
-          (
-              cd "$engine/iphoneos"
-              xcrun --sdk iphoneos clang++ "${flags[@]}" -ObjC -L"$angle/iphoneos/lib" \
-                  "$work/Host.o" $(cat "$engine/LINK") \
-                  -framework ImageIO -weak_framework OpenGLES -o "$app/TubbyLegacy"
-          )
-          plutil -lint "$app/Info.plist"
-          xcrun vtool -show-build "$app/TubbyLegacy" | grep -Eq 'platform[[:space:]]+IOS'
-          codesign --force --sign - --timestamp=none "$app"
-          codesign --verify --strict "$app"
-          (
-              cd "$work"
-              zip -q -r "TubbyLegacy-v0.1.0-EN-RU-UK.ipa" Payload
-          )
-          unzip -tq "$work/TubbyLegacy-v0.1.0-EN-RU-UK.ipa"
-          TUBBYLEGACY_BUILD_IOS_SH
-
-      - name: Build and verify the IPA
+      - name: Build the IPA
         shell: bash
         run: |
-          set -euo pipefail
-          xcodebuild -version
           bash "$RUNNER_TEMP/tubbylegacy-port/build-ios.sh" "$RUNNER_TEMP/tubbylegacy-build" 2>&1 | tee "$RUNNER_TEMP/tubbylegacy-build.log"
 
-      - name: Upload TubbyLegacy IPA
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: TubbyLegacy-iOS-EN-RU-UK
           path: ${{ runner.temp }}/tubbylegacy-build/TubbyLegacy-v0.1.0-EN-RU-UK.ipa
           if-no-files-found: error
 
-      - name: Upload build log
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: TubbyLegacy-build-log
           path: ${{ runner.temp }}/tubbylegacy-build.log
