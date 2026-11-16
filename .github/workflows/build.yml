@@ -1,0 +1,44 @@
+name: TubbyLegacy iOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare the game and translations
+        shell: bash
+        run: |
+          ruby -ryaml -e '
+            workflow = YAML.load_file("tubbylegacy-ios.yml")
+            puts workflow.fetch("jobs").fetch("package")
+              .fetch("steps").first.fetch("run")
+          ' | bash -e -o pipefail
+
+      - name: Build the IPA
+        shell: bash
+        run: |
+          bash "$RUNNER_TEMP/tubbylegacy-port/build-ios.sh" \
+            "$RUNNER_TEMP/tubbylegacy-build" 2>&1 \
+            | tee "$RUNNER_TEMP/tubbylegacy-build.log"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TubbyLegacy-iOS-EN-RU-UK
+          path: ${{ runner.temp }}/tubbylegacy-build/TubbyLegacy-v0.1.0-EN-RU-UK.ipa
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: TubbyLegacy-build-log
+          path: ${{ runner.temp }}/tubbylegacy-build.log
+          if-no-files-found: ignore
